@@ -30,6 +30,10 @@ CHANNEL_URL = "https://t.me/musicalmeet"
 OPENAI_IMAGE_MODEL = "gpt-image-2"
 
 
+# ============================================================
+# ПРОВЕРКА SECRETS
+# ============================================================
+
 if not BOT_TOKEN:
     raise RuntimeError(
         "BOT_TOKEN не задан в Secrets"
@@ -46,7 +50,8 @@ if not OPENAI_API_KEY:
 # ============================================================
 
 logging.basicConfig(
-    level=logging.INFO
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 
 log = logging.getLogger(
@@ -78,10 +83,10 @@ openai_client = OpenAI(
 # СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЕЙ
 # ============================================================
 
-# Пользователи, которые прошли проверку подписки
+# Пользователи, которые уже проходили проверку
 verified_users = set()
 
-# Пользователи, которым бот сейчас обрабатывает фото
+# Пользователи, которым сейчас обрабатывается фото
 processing_users = set()
 
 
@@ -103,7 +108,7 @@ def subscription_keyboard():
 
             [
                 InlineKeyboardButton(
-                    text="✅ Проверить",
+                    text="✅ Проверить подписку",
                     callback_data="check_subscription"
                 )
             ]
@@ -127,6 +132,12 @@ async def check_subscription(
             user_id=user_id
         )
 
+        log.info(
+            "Subscription check: user=%s status=%s",
+            user_id,
+            member.status
+        )
+
         return member.status in {
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
@@ -136,7 +147,8 @@ async def check_subscription(
     except Exception as e:
 
         log.exception(
-            "Ошибка проверки подписки: %s",
+            "Ошибка проверки подписки для user=%s: %r",
+            user_id,
             e
         )
 
@@ -144,7 +156,7 @@ async def check_subscription(
 
 
 # ============================================================
-# СООБЩЕНИЕ ПОСЛЕ ПОДПИСКИ
+# ИНСТРУКЦИЯ ПОСЛЕ ПОДПИСКИ
 # ============================================================
 
 async def send_photo_instruction(
@@ -154,12 +166,12 @@ async def send_photo_instruction(
     await message.answer(
         "Здравствуйте! 👋\n\n"
         "Теперь пришлите ваше фото в чат.\n\n"
-        "📸 Отправьте **только одно фото** "
-        "человека, и я верну этого же человека, "
-        "но уже в стильном **ДРИПЧИКЕ** 😎🔥\n\n"
+        "📸 Отправьте <b>одно фото</b> человека, "
+        "и я верну этого же человека, "
+        "но уже в стильном <b>ДРИПЧИКЕ</b> 😎🔥\n\n"
         "Лучше всего подойдёт фото, где человека "
         "хорошо видно целиком или по пояс.",
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 
@@ -179,15 +191,13 @@ async def start(
 
     user_id = message.from_user.id
 
-    # Если пользователь уже проходил проверку
-    if user_id in verified_users:
+    log.info(
+        "/start от пользователя %s",
+        user_id
+    )
 
-        await send_photo_instruction(
-            message
-        )
-
-        return
-
+    # Даже если пользователь проверялся раньше,
+    # повторно проверяем актуальную подписку.
     subscribed = await check_subscription(
         user_id
     )
@@ -203,6 +213,10 @@ async def start(
         )
 
         return
+
+    verified_users.discard(
+        user_id
+    )
 
     await message.answer(
         "Здравствуйте! 👋\n\n"
@@ -228,6 +242,11 @@ async def check_subscription_callback(
 
     user_id = callback.from_user.id
 
+    log.info(
+        "Проверка подписки по кнопке: user=%s",
+        user_id
+    )
+
     subscribed = await check_subscription(
         user_id
     )
@@ -251,27 +270,36 @@ async def check_subscription_callback(
 
     try:
 
-        await callback.message.edit_text(
-            "Здравствуйте! 👋\n\n"
-            "Теперь пришлите ваше фото в чат.\n\n"
-            "📸 Отправьте **только одно фото** "
-            "человека, и я верну этого же человека, "
-            "но уже в стильном **ДРИПЧИКЕ** 😎🔥\n\n"
-            "Лучше всего подойдёт фото, где человека "
-            "хорошо видно целиком или по пояс.",
-            parse_mode="Markdown"
+        if callback.message:
+
+            await callback.message.edit_text(
+                "Здравствуйте! 👋\n\n"
+                "Теперь пришлите ваше фото в чат.\n\n"
+                "📸 Отправьте <b>одно фото</b> человека, "
+                "и я верну этого же человека, "
+                "но уже в стильном <b>ДРИПЧИКЕ</b> 😎🔥\n\n"
+                "Лучше всего подойдёт фото, где человека "
+                "хорошо видно целиком или по пояс.",
+                parse_mode="HTML"
+            )
+
+    except Exception as e:
+
+        log.exception(
+            "Не удалось изменить сообщение после проверки подписки: %r",
+            e
         )
 
-    except Exception:
+        if callback.message:
 
-        await callback.message.answer(
-            "Здравствуйте! 👋\n\n"
-            "Теперь пришлите ваше фото в чат.\n\n"
-            "📸 Отправьте **только одно фото** "
-            "человека, и я верну этого же человека, "
-            "но уже в стильном **ДРИПЧИКЕ** 😎🔥",
-            parse_mode="Markdown"
-        )
+            await callback.message.answer(
+                "Здравствуйте! 👋\n\n"
+                "Теперь пришлите ваше фото в чат.\n\n"
+                "📸 Отправьте <b>одно фото</b> человека, "
+                "и я верну этого же человека, "
+                "но уже в стильном <b>ДРИПЧИКЕ</b> 😎🔥",
+                parse_mode="HTML"
+            )
 
 
 # ============================================================
@@ -287,8 +315,6 @@ async def require_subscription(
 
     user_id = message.from_user.id
 
-    # Не полагаемся только на память процесса:
-    # снова проверяем Telegram.
     subscribed = await check_subscription(
         user_id
     )
@@ -325,79 +351,228 @@ async def edit_photo_with_openai(
     prompt = """
 Edit the provided photograph.
 
-IMPORTANT:
-Keep the exact same person.
-Preserve their face, identity, facial features,
-skin tone, hair, body proportions, pose,
-hands, expression, camera angle and overall
-photographic realism.
+MAIN OBJECTIVE:
+Keep the exact same person from the input photograph
+and change ONLY their clothing into a fashionable,
+modern streetwear drip outfit.
 
-ONLY change the person's clothing.
+IDENTITY PRESERVATION IS EXTREMELY IMPORTANT.
 
-Dress the person in a modern, stylish,
-high-quality streetwear "drip" outfit.
+Keep the same:
+- person
+- face
+- facial features
+- eyes
+- nose
+- mouth
+- hairstyle
+- skin tone
+- age
+- body proportions
+- body shape
+- pose
+- hands
+- fingers
+- expression
+- camera angle
+- perspective
 
-The outfit should look natural on this exact person
-and fit their body and pose correctly.
+Do NOT replace the person with another person.
 
-Use fashionable contemporary streetwear:
-premium hoodie or jacket, stylish pants,
-clean sneakers and tasteful accessories when
-appropriate.
+Do NOT generate a new face.
 
-Do NOT change the person's face.
-Do NOT change the person's age.
-Do NOT change the person's body.
-Do NOT replace the person.
-Do NOT create a different person.
+Do NOT alter the person's identity.
 
-Keep the original background and lighting
-as close to the original as possible.
+CLOTHING:
+Replace only the original clothing with a premium,
+modern streetwear outfit.
 
-The final image must look like a real photograph,
-not an illustration or cartoon.
+The outfit should look like realistic contemporary
+"drip" fashion.
 
-Keep everything except the clothing as close
-to the original photograph as possible.
+Use combinations such as:
+- premium oversized hoodie
+- stylish jacket
+- fashionable pants
+- clean modern sneakers
+- tasteful chains or accessories when appropriate
+
+The clothing must naturally fit the person's body,
+pose and perspective.
+
+REALISM:
+The result must look like a real photograph.
+
+Do NOT make it:
+- cartoon
+- anime
+- illustration
+- painting
+- 3D render
+- artificial-looking character
+
+Keep the original background as close as possible.
+
+Keep the original lighting as close as possible.
+
+Keep the original composition and camera perspective.
+
+Do not unnecessarily modify anything except the clothing.
+
+The final result should look like the same photograph
+of the same person, but wearing a stylish premium
+streetwear drip outfit.
 """
 
     def make_edit():
+
+        log.info(
+            "Sending image to OpenAI. Bytes=%s",
+            len(image_bytes)
+        )
 
         image_file = BytesIO(
             image_bytes
         )
 
+        # Важно: имя файла помогает SDK определить формат.
         image_file.name = "person.jpg"
 
-        result = openai_client.images.edit(
-            model=OPENAI_IMAGE_MODEL,
-            image=image_file,
-            prompt=prompt,
-            size="1024x1024",
-            quality="medium"
-        )
+        try:
+
+            result = openai_client.images.edit(
+                model=OPENAI_IMAGE_MODEL,
+                image=image_file,
+                prompt=prompt,
+                size="1024x1024",
+                quality="medium"
+            )
+
+        except Exception as e:
+
+            log.exception(
+                "OpenAI images.edit ERROR: %r",
+                e
+            )
+
+            raise RuntimeError(
+                f"Ошибка OpenAI: {e}"
+            ) from e
+
+        # ====================================================
+        # ПРОВЕРКА ОТВЕТА OPENAI
+        # ====================================================
+
+        if not result:
+
+            raise RuntimeError(
+                "OpenAI вернул пустой response"
+            )
 
         if not result.data:
+
             raise RuntimeError(
-                "OpenAI не вернул изображение"
+                "OpenAI не вернул data"
             )
 
-        encoded = result.data[0].b64_json
+        first_result = result.data[0]
 
-        if not encoded:
-            raise RuntimeError(
-                "OpenAI не вернул base64 изображения"
-            )
-
-        return base64.b64decode(
-            encoded
+        # GPT Image обычно возвращает base64.
+        encoded = getattr(
+            first_result,
+            "b64_json",
+            None
         )
 
-    # OpenAI SDK синхронный, поэтому
-    # не блокируем Telegram event loop.
+        if not encoded:
+
+            raise RuntimeError(
+                "OpenAI не вернул b64_json изображения"
+            )
+
+        try:
+
+            decoded = base64.b64decode(
+                encoded
+            )
+
+        except Exception as e:
+
+            log.exception(
+                "Ошибка декодирования base64: %r",
+                e
+            )
+
+            raise RuntimeError(
+                "Не удалось декодировать изображение OpenAI"
+            ) from e
+
+        if not decoded:
+
+            raise RuntimeError(
+                "После декодирования изображение пустое"
+            )
+
+        log.info(
+            "OpenAI image received successfully. Bytes=%s",
+            len(decoded)
+        )
+
+        return decoded
+
+    # Синхронный OpenAI SDK запускаем
+    # в отдельном потоке, чтобы не блокировать Telegram.
     return await asyncio.to_thread(
         make_edit
     )
+
+
+# ============================================================
+# СКАЧИВАНИЕ ФОТО TELEGRAM
+# ============================================================
+
+async def download_telegram_photo(
+    file_id: str
+) -> bytes:
+
+    log.info(
+        "Получение Telegram file: %s",
+        file_id
+    )
+
+    telegram_file = await bot.get_file(
+        file_id
+    )
+
+    if not telegram_file.file_path:
+
+        raise RuntimeError(
+            "Telegram не вернул file_path"
+        )
+
+    photo_buffer = BytesIO()
+
+    await bot.download_file(
+        telegram_file.file_path,
+        destination=photo_buffer
+    )
+
+    source_bytes = (
+        photo_buffer.getvalue()
+    )
+
+    if not source_bytes:
+
+        raise RuntimeError(
+            "Telegram скачал пустой файл"
+        )
+
+    log.info(
+        "Telegram photo downloaded. Bytes=%s",
+        len(source_bytes)
+    )
+
+    return source_bytes
 
 
 # ============================================================
@@ -414,19 +589,31 @@ async def photo_handler(
     if not message.from_user:
         return
 
-    # Проверяем подписку
+    user_id = message.from_user.id
+
+    log.info(
+        "Получено фото от user=%s",
+        user_id
+    )
+
+    # ========================================================
+    # ПРОВЕРКА ПОДПИСКИ
+    # ========================================================
+
     if not await require_subscription(
         message
     ):
         return
 
-    user_id = message.from_user.id
+    # ========================================================
+    # ЗАЩИТА ОТ ДВОЙНОЙ ОБРАБОТКИ
+    # ========================================================
 
-    # Защита от одновременной обработки
     if user_id in processing_users:
 
         await message.answer(
-            "⏳ Я ещё обрабатываю ваше предыдущее фото."
+            "⏳ Я ещё обрабатываю ваше предыдущее фото.\n\n"
+            "Пожалуйста, дождитесь результата."
         )
 
         return
@@ -437,85 +624,125 @@ async def photo_handler(
 
     try:
 
-        # Telegram берёт самое большое доступное
-        # разрешение фотографии.
-        photo = message.photo[-1]
+        # ====================================================
+        # СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЮ
+        # ====================================================
 
         await message.answer(
-            "⏳ Получил фото!\n\n"
-            "👕 Подбираю тебе ДРИПЧИК...\n"
-            "🔥 Это может занять некоторое время."
+            "⏳ <b>Получил фото!</b>\n\n"
+            "👕 Подбираю тебе <b>ДРИПЧИК</b>...\n"
+            "🔥 Наношу новый образ.\n\n"
+            "Это может занять некоторое время.",
+            parse_mode="HTML"
         )
 
-        # Получаем Telegram-файл
-        telegram_file = await bot.get_file(
+        # ====================================================
+        # БЕРЁМ САМОЕ КАЧЕСТВЕННОЕ ФОТО
+        # ====================================================
+
+        photo = message.photo[-1]
+
+        log.info(
+            "Telegram photo selected: "
+            "file_id=%s width=%s height=%s size=%s",
+            photo.file_id,
+            photo.width,
+            photo.height,
+            photo.file_size
+        )
+
+        # ====================================================
+        # СКАЧИВАЕМ ФОТО
+        # ====================================================
+
+        source_bytes = await download_telegram_photo(
             photo.file_id
         )
 
-        # Скачиваем фото в память
-        photo_buffer = BytesIO()
-
-        await bot.download_file(
-            telegram_file.file_path,
-            destination=photo_buffer
-        )
-
-        source_bytes = (
-            photo_buffer.getvalue()
-        )
-
-        if not source_bytes:
-
-            raise RuntimeError(
-                "Не удалось скачать фотографию"
-            )
+        # ====================================================
+        # OPENAI
+        # ====================================================
 
         log.info(
-            "Processing photo for user %s",
+            "Начинаю обработку OpenAI для user=%s",
             user_id
         )
 
-        # Отправляем изображение в OpenAI
         edited_bytes = await edit_photo_with_openai(
             source_bytes
         )
 
-        # Отправляем результат
-        result_photo = BytesIO(
-            edited_bytes
+        # ====================================================
+        # ПРОВЕРКА РЕЗУЛЬТАТА
+        # ====================================================
+
+        if not edited_bytes:
+
+            raise RuntimeError(
+                "OpenAI вернул пустой результат"
+            )
+
+        log.info(
+            "Обработка завершена для user=%s. "
+            "Result bytes=%s",
+            user_id,
+            len(edited_bytes)
         )
 
-        result_photo.name = (
-            "drip.jpg"
-        )
+        # ====================================================
+        # ОТПРАВЛЯЕМ ФОТО
+        # ====================================================
 
         await message.answer_photo(
             photo=types.BufferedInputFile(
                 edited_bytes,
-                filename="drip.jpg"
+                filename="drip.png"
             ),
             caption=(
-                "🔥 Вот твой ДРИПЧИК!\n\n"
+                "🔥 <b>Вот твой ДРИПЧИК!</b>\n\n"
                 "😎 Образ обновлён."
-            )
+            ),
+            parse_mode="HTML"
+        )
+
+        log.info(
+            "Результат успешно отправлен user=%s",
+            user_id
         )
 
     except Exception as e:
 
+        # ====================================================
+        # ПОЛНЫЙ ЛОГ ОШИБКИ
+        # ====================================================
+
         log.exception(
-            "Image processing error: %s",
+            "Image processing error for user=%s: %r",
+            user_id,
             e
         )
 
+        # ====================================================
+        # СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЮ
+        # ====================================================
+
         await message.answer(
-            "❌ Не получилось обработать фото.\n\n"
-            "Попробуйте отправить другое фото "
-            "и убедитесь, что на нём хорошо видно человека."
+            "❌ <b>Не получилось обработать фото.</b>\n\n"
+            "Попробуйте отправить другое фото, "
+            "где человека хорошо видно.\n\n"
+            "Если ошибка повторяется, попробуйте "
+            "ещё раз через некоторое время.",
+            parse_mode="HTML"
         )
 
     finally:
 
         processing_users.discard(
+            user_id
+        )
+
+        log.info(
+            "Processing lock released for user=%s",
             user_id
         )
 
@@ -538,9 +765,10 @@ async def other_message(
         return
 
     await message.answer(
-        "📸 Пришлите именно **одно фото** человека.\n\n"
-        "После этого я сделаю ему стильный ДРИПЧИК 😎🔥",
-        parse_mode="Markdown"
+        "📸 Пришлите именно <b>одно фото</b> человека.\n\n"
+        "После этого я сделаю ему стильный "
+        "<b>ДРИПЧИК</b> 😎🔥",
+        parse_mode="HTML"
     )
 
 
@@ -551,7 +779,15 @@ async def other_message(
 async def main():
 
     log.info(
-        "🐻‍❄️ White Bear Drip Bot starting..."
+        "========================================"
+    )
+
+    log.info(
+        "🐻‍❄️ WHITE BEAR DRIP BOT"
+    )
+
+    log.info(
+        "========================================"
     )
 
     log.info(
@@ -563,6 +799,33 @@ async def main():
         "OpenAI image model: %s",
         OPENAI_IMAGE_MODEL
     )
+
+    log.info(
+        "Bot starting..."
+    )
+
+    # Удаляем старый webhook перед polling.
+    # Это предотвращает конфликт webhook/polling.
+    try:
+
+        await bot.delete_webhook(
+            drop_pending_updates=False
+        )
+
+        log.info(
+            "Webhook removed successfully"
+        )
+
+    except Exception as e:
+
+        log.exception(
+            "Не удалось удалить webhook: %r",
+            e
+        )
+
+    # ========================================================
+    # START POLLING
+    # ========================================================
 
     await dp.start_polling(
         bot,
@@ -586,4 +849,11 @@ if __name__ == "__main__":
 
         log.info(
             "Bot stopped"
+        )
+
+    except Exception as e:
+
+        log.exception(
+            "Fatal bot error: %r",
+            e
         )
