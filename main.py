@@ -1,19 +1,14 @@
 import os
 import asyncio
-import base64
 import logging
 from io import BytesIO
 
+import cv2
+import numpy as np
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
-from aiogram.types import (
-    Message,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from aiogram.enums import ChatMemberStatus
-
-from openai import OpenAI
+from aiogram.types import Message
 
 
 # ============================================================
@@ -21,754 +16,752 @@ from openai import OpenAI
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
-CHANNEL_USERNAME = "@musicalmeet"
-CHANNEL_URL = "https://t.me/musicalmeet"
-
-# Модель редактирования изображений
-OPENAI_IMAGE_MODEL = "gpt-image-2"
-
-
-# ============================================================
-# ПРОВЕРКА SECRETS
-# ============================================================
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN не задан в Secrets"
-    )
+    raise RuntimeError("BOT_TOKEN не задан в Secrets")
 
-if not OPENAI_API_KEY:
-    raise RuntimeError(
-        "OPENAI_API_KEY не задан в Secrets"
-    )
+
+# Размер готовой картинки
+CANVAS_SIZE = 1200
+
+# Максимальный размер входной картинки для обработки
+MAX_INPUT_SIZE = 1600
 
 
 # ============================================================
 # LOGGING
 # ============================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
-
-log = logging.getLogger(
-    "whitebear-drip"
-)
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("clothing-layout-bot")
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-bot = Bot(
-    token=BOT_TOKEN
-)
-
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
 # ============================================================
-# OPENAI
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
 
-openai_client = OpenAI(
-    api_key=OPENAI_API_KEY
-)
+def resize_for_processing(img: np.ndarray) -> np.ndarray:
+    h, w = img.shape[:2]
+    longest = max(h, w)
+
+    if longest <= MAX_INPUT_SIZE:
+        return img
+
+    scale = MAX_INPUT_SIZE / longest
+    return cv2.resize(
+        img,
+        (int(w * scale), int(h * scale)),
+        interpolation=cv2.INTER_AREA
+    )
 
 
-# ============================================================
-# СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЕЙ
-# ============================================================
+def decode_image(data: bytes) -> np.ndarray:
+    arr = np.frombuffer(data, dtype=np.uint8)
+    image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-# Пользователи, которые уже проходили проверку
-verified_users = set()
+    if image is None:
+        raise ValueError("Не удалось открыть изображение")
 
-# Пользователи, которым сейчас обрабатывается фото
-processing_users = set()
+    return resize_for_processing(image)
 
 
-# ============================================================
-# КЛАВИАТУРА ПОДПИСКИ
-# ============================================================
+def white_background_mask(image: np.ndarray) -> np.ndarray:
+    """
+    Полностью обычная компьютерная обработка:
+    ищем пиксели, близкие к белому, и считаем их фоном.
+    Никаких AI/нейросетей здесь нет.
+    """
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-def subscription_keyboard():
+    # Белый/очень светлый фон
+    white = cv2.inRange(
+        hsv,
+        np.array([0, 0, 205], dtype=np.uint8),
+        np.array([180, 70, 255], dtype=np.uint8)
+    )
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    foreground = 255 - white
 
-            [
-                InlineKeyboardButton(
-                    text="📢 Подписаться на канал",
-                    url=CHANNEL_URL
+    kernel = np.ones((5, 5), np.uint8)
+    foreground = cv2.morphologyEx(
+        foreground,
+        cv2.MORPH_OPEN,
+        kernel,
+        iterations=1
+    )
+    foreground = cv2.morphologyEx(
+        foreground,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=2
+    )
+
+    # Убираем мелкий мусор
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        foreground,
+        connectivity=8
+    )
+
+    clean = np.zeros_like(foreground)
+    image_area = image.shape[0] * image.shape[1]
+    min_area = max(150, int(image_area * 0.0015))
+
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            clean[labels == i] = 255
+
+    return clean
+
+
+def grabcut_mask(image: np.ndarray) -> np.ndarray:
+    """
+    Запасной вариант без AI.
+    OpenCV GrabCut использует классический алгоритм сегментации.
+    """
+    h, w = image.shape[:2]
+
+    mask = np.full(
+        (h, w),
+        cv2.GC_PR_BGD,
+        dtype=np.uint8
+    )
+
+    # Уверенный фон по краям
+    border = max(5, min(h, w) // 35)
+    mask[:border, :] = cv2.GC_BGD
+    mask[-border:, :] = cv2.GC_BGD
+    mask[:, :border] = cv2.GC_BGD
+    mask[:, -border:] = cv2.GC_BGD
+
+    # Центральная область — вероятный объект
+    x1 = int(w * 0.08)
+    y1 = int(h * 0.06)
+    x2 = int(w * 0.92)
+    y2 = int(h * 0.94)
+
+    mask[y1:y2, x1:x2] = cv2.GC_PR_FGD
+
+    # Если фон почти белый, сразу считаем непохожие на белый
+    # пиксели вероятным передним планом.
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    not_white = cv2.inRange(
+        hsv,
+        np.array([0, 35, 20], dtype=np.uint8),
+        np.array([180, 255, 240], dtype=np.uint8)
+    )
+
+    mask[not_white > 0] = cv2.GC_PR_FGD
+
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+
+    try:
+        cv2.grabCut(
+            image,
+            mask,
+            None,
+            bgd_model,
+            fgd_model,
+            5,
+            cv2.GC_INIT_WITH_MASK
+        )
+    except cv2.error:
+        # Если GrabCut не смог обработать фото,
+        # возвращаем простую маску.
+        return not_white
+
+    result = np.where(
+        (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD),
+        255,
+        0
+    ).astype(np.uint8)
+
+    kernel = np.ones((5, 5), np.uint8)
+    result = cv2.morphologyEx(
+        result,
+        cv2.MORPH_OPEN,
+        kernel,
+        iterations=1
+    )
+    result = cv2.morphologyEx(
+        result,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=2
+    )
+
+    return result
+
+
+def build_foreground(image: np.ndarray):
+    """
+    Получаем одежду/предмет без фона.
+    """
+    mask = white_background_mask(image)
+
+    image_area = image.shape[0] * image.shape[1]
+    mask_area = cv2.countNonZero(mask)
+
+    # Если простая обработка нашла слишком мало/много,
+    # используем классический GrabCut.
+    ratio = mask_area / max(1, image_area)
+
+    if ratio < 0.01 or ratio > 0.92:
+        mask = grabcut_mask(image)
+
+    # Ещё раз чистим маску
+    kernel = np.ones((7, 7), np.uint8)
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=2
+    )
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        kernel,
+        iterations=1
+    )
+
+    # Оставляем достаточно крупные области.
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask,
+        connectivity=8
+    )
+
+    components = []
+    min_area = max(300, int(image_area * 0.002))
+
+    for i in range(1, num_labels):
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        area = stats[i, cv2.CC_STAT_AREA]
+
+        if area < min_area:
+            continue
+
+        # Не берём огромную область, если это почти весь кадр:
+        # GrabCut/фон мог слиться с предметом.
+        component_mask = np.where(labels == i, 255, 0).astype(np.uint8)
+
+        pad = max(4, int(min(w, h) * 0.025))
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(image.shape[1], x + w + pad)
+        y2 = min(image.shape[0], y + h + pad)
+
+        crop = image[y1:y2, x1:x2]
+        crop_mask = component_mask[y1:y2, x1:x2]
+
+        components.append({
+            "image": crop,
+            "mask": crop_mask,
+            "x": x,
+            "y": y,
+            "w": w,
+            "h": h,
+            "area": area
+        })
+
+    # Если отдельных объектов много, оставляем самые крупные.
+    components.sort(key=lambda c: c["area"], reverse=True)
+    components = components[:8]
+
+    if not components:
+        # Последний вариант: считаем весь предмет центральным.
+        return [{
+            "image": image,
+            "mask": np.ones(
+                image.shape[:2],
+                dtype=np.uint8
+            ) * 255,
+            "x": 0,
+            "y": 0,
+            "w": image.shape[1],
+            "h": image.shape[0],
+            "area": image.shape[0] * image.shape[1]
+        }]
+
+    return components
+
+
+def object_type(component) -> str:
+    """
+    Простая геометрическая классификация.
+    Это НЕ AI.
+    Нужна только для аккуратной раскладки вещей.
+    """
+    w = component["w"]
+    h = component["h"]
+    area = component["area"]
+
+    ratio = w / max(1, h)
+    canvas_area = component["image"].shape[0] * component["image"].shape[1]
+    fill = area / max(1, canvas_area)
+
+    # Длинный вертикальный объект — брюки/штаны.
+    if ratio < 0.62 and h > w * 1.35:
+        return "pants"
+
+    # Маленький вытянутый объект — чаще обувь/аксессуар.
+    if ratio > 1.35 and h < w * 0.75:
+        return "shoes"
+
+    # Небольшой компактный объект — аксессуар.
+    if fill < 0.18 and max(w, h) < 0.45 * max(
+        component["image"].shape[0],
+        component["image"].shape[1]
+    ):
+        return "accessory"
+
+    return "top"
+
+
+def add_shadow(canvas: np.ndarray, x: int, y: int, w: int, h: int):
+    """
+    Лёгкая тень под предметом для аккуратного каталожного вида.
+    """
+    overlay = canvas.copy()
+
+    cx = x + w // 2
+    cy = y + h - max(8, h // 35)
+
+    axes = (
+        max(10, w // 3),
+        max(5, h // 18)
+    )
+
+    cv2.ellipse(
+        overlay,
+        (cx, cy),
+        axes,
+        0,
+        0,
+        360,
+        (225, 225, 225),
+        -1
+    )
+
+    overlay = cv2.GaussianBlur(
+        overlay,
+        (0, 0),
+        12
+    )
+
+    # Тень очень слабая
+    canvas[:] = cv2.addWeighted(
+        canvas,
+        0.88,
+        overlay,
+        0.12,
+        0
+    )
+
+
+def fit_rgba_to_box(
+    rgba: np.ndarray,
+    box_w: int,
+    box_h: int
+) -> np.ndarray:
+    h, w = rgba.shape[:2]
+
+    scale = min(
+        box_w / max(1, w),
+        box_h / max(1, h)
+    )
+
+    nw = max(1, int(w * scale))
+    nh = max(1, int(h * scale))
+
+    return cv2.resize(
+        rgba,
+        (nw, nh),
+        interpolation=cv2.INTER_AREA
+    )
+
+
+def paste_rgba(
+    canvas: np.ndarray,
+    rgba: np.ndarray,
+    x: int,
+    y: int
+):
+    """
+    Накладывает PNG-подобный RGBA объект на белый фон.
+    """
+    h, w = rgba.shape[:2]
+
+    if x >= canvas.shape[1] or y >= canvas.shape[0]:
+        return
+
+    x1 = max(0, x)
+    y1 = max(0, y)
+    x2 = min(canvas.shape[1], x + w)
+    y2 = min(canvas.shape[0], y + h)
+
+    if x2 <= x1 or y2 <= y1:
+        return
+
+    src = rgba[
+        y1 - y:y2 - y,
+        x1 - x:x2 - x
+    ]
+
+    alpha = (
+        src[:, :, 3:4].astype(np.float32) / 255.0
+    )
+
+    rgb = src[:, :, :3].astype(np.float32)
+    dst = canvas[y1:y2, x1:x2].astype(np.float32)
+
+    result = (
+        rgb * alpha +
+        dst * (1.0 - alpha)
+    )
+
+    canvas[y1:y2, x1:x2] = np.clip(
+        result,
+        0,
+        255
+    ).astype(np.uint8)
+
+
+def component_to_rgba(component):
+    image = component["image"]
+    mask = component["mask"]
+
+    # Небольшое сглаживание краёв.
+    alpha = cv2.GaussianBlur(
+        mask,
+        (5, 5),
+        0
+    )
+
+    bgr = image
+    rgba = cv2.cvtColor(
+        bgr,
+        cv2.COLOR_BGR2BGRA
+    )
+    rgba[:, :, 3] = alpha
+
+    return rgba
+
+
+def make_catalog_image(image: np.ndarray) -> bytes:
+    """
+    Основная функция.
+
+    Если на фото одна вещь:
+        она аккуратно помещается на белый фон.
+
+    Если на фото несколько раздельных вещей:
+        они раскладываются по категориям:
+        верх / низ / обувь / аксессуары.
+
+    Никакой генерации изображения и никакой AI-модели.
+    """
+    components = build_foreground(image)
+
+    typed = []
+    for component in components:
+        component["type"] = object_type(component)
+        typed.append(component)
+
+    # Сортируем так, чтобы крупные предметы были основными.
+    typed.sort(
+        key=lambda c: c["area"],
+        reverse=True
+    )
+
+    # Если найден только один предмет — не меняем его
+    # положение/ориентацию, просто делаем красивый белый фон.
+    if len(typed) == 1:
+        comp = typed[0]
+        rgba = component_to_rgba(comp)
+
+        # Максимальная зона для одной вещи.
+        rgba = fit_rgba_to_box(
+            rgba,
+            820,
+            980
+        )
+
+        canvas = np.full(
+            (CANVAS_SIZE, CANVAS_SIZE, 3),
+            255,
+            dtype=np.uint8
+        )
+
+        x = (CANVAS_SIZE - rgba.shape[1]) // 2
+        y = (CANVAS_SIZE - rgba.shape[0]) // 2
+
+        paste_rgba(
+            canvas,
+            rgba,
+            x,
+            y
+        )
+
+    else:
+        # Каталожная раскладка.
+        # Верх: одежда/аксессуары.
+        # Низ: штаны/обувь.
+        canvas = np.full(
+            (CANVAS_SIZE, CANVAS_SIZE, 3),
+            255,
+            dtype=np.uint8
+        )
+
+        tops = [
+            c for c in typed
+            if c["type"] == "top"
+        ]
+        pants = [
+            c for c in typed
+            if c["type"] == "pants"
+        ]
+        shoes = [
+            c for c in typed
+            if c["type"] == "shoes"
+        ]
+        accessories = [
+            c for c in typed
+            if c["type"] == "accessory"
+        ]
+
+        # Если классификация неидеальна, крупные предметы
+        # всё равно будут показаны.
+        if not tops:
+            tops = typed[:1]
+
+        # ---- ВЕРХ ----
+        top_positions = [
+            (55, 55, 520, 450),
+            (625, 55, 520, 450),
+        ]
+
+        top_items = tops[:2] + accessories[:1]
+
+        # Если аксессуар есть, стараемся поставить его справа сверху.
+        for index, comp in enumerate(top_items[:2]):
+            box = top_positions[index]
+
+            rgba = component_to_rgba(comp)
+            rgba = fit_rgba_to_box(
+                rgba,
+                box[2],
+                box[3]
+            )
+
+            x = box[0] + (box[2] - rgba.shape[1]) // 2
+            y = box[1] + (box[3] - rgba.shape[0]) // 2
+
+            paste_rgba(canvas, rgba, x, y)
+
+        # ---- НИЗ / ШТАНЫ ----
+        if pants:
+            comp = pants[0]
+            rgba = component_to_rgba(comp)
+            rgba = fit_rgba_to_box(
+                rgba,
+                500,
+                570
+            )
+
+            x = 70 + (500 - rgba.shape[1]) // 2
+            y = 545 + (570 - rgba.shape[0]) // 2
+
+            paste_rgba(canvas, rgba, x, y)
+
+        # ---- ОБУВЬ ----
+        shoe_items = shoes[:2]
+
+        if shoe_items:
+            if len(shoe_items) == 1:
+                boxes = [(650, 600, 470, 360)]
+            else:
+                boxes = [
+                    (620, 610, 250, 330),
+                    (850, 610, 250, 330)
+                ]
+
+            for index, comp in enumerate(shoe_items):
+                box = boxes[index]
+
+                rgba = component_to_rgba(comp)
+                rgba = fit_rgba_to_box(
+                    rgba,
+                    box[2],
+                    box[3]
                 )
-            ],
 
-            [
-                InlineKeyboardButton(
-                    text="✅ Проверить подписку",
-                    callback_data="check_subscription"
-                )
-            ]
+                x = box[0] + (box[2] - rgba.shape[1]) // 2
+                y = box[1] + (box[3] - rgba.shape[0]) // 2
 
+                paste_rgba(canvas, rgba, x, y)
+
+        # ---- ДОПОЛНИТЕЛЬНЫЕ ПРЕДМЕТЫ ----
+        # Если осталось несколько крупных предметов,
+        # размещаем их в свободной зоне без изменения содержимого.
+        used_ids = set(
+            id(x) for x in top_items[:2] + pants[:1] + shoe_items
+        )
+
+        leftovers = [
+            c for c in typed
+            if id(c) not in used_ids
+        ][:3]
+
+        free_boxes = [
+            (40, 940, 340, 210),
+            (430, 940, 340, 210),
+            (820, 940, 340, 210),
+        ]
+
+        for index, comp in enumerate(leftovers):
+            if index >= len(free_boxes):
+                break
+
+            box = free_boxes[index]
+
+            rgba = component_to_rgba(comp)
+            rgba = fit_rgba_to_box(
+                rgba,
+                box[2],
+                box[3]
+            )
+
+            x = box[0] + (box[2] - rgba.shape[1]) // 2
+            y = box[1] + (box[3] - rgba.shape[0]) // 2
+
+            paste_rgba(canvas, rgba, x, y)
+
+    # Сохраняем JPEG.
+    output = BytesIO()
+    success, encoded = cv2.imencode(
+        ".jpg",
+        canvas,
+        [
+            int(cv2.IMWRITE_JPEG_QUALITY),
+            95
         ]
     )
 
+    if not success:
+        raise RuntimeError("Не удалось создать итоговое изображение")
 
-# ============================================================
-# ПРОВЕРКА ПОДПИСКИ
-# ============================================================
-
-async def check_subscription(
-    user_id: int
-) -> bool:
-
-    try:
-
-        member = await bot.get_chat_member(
-            chat_id=CHANNEL_USERNAME,
-            user_id=user_id
-        )
-
-        log.info(
-            "Subscription check: user=%s status=%s",
-            user_id,
-            member.status
-        )
-
-        return member.status in {
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.CREATOR
-        }
-
-    except Exception as e:
-
-        log.exception(
-            "Ошибка проверки подписки для user=%s: %r",
-            user_id,
-            e
-        )
-
-        return False
-
-
-# ============================================================
-# ИНСТРУКЦИЯ ПОСЛЕ ПОДПИСКИ
-# ============================================================
-
-async def send_photo_instruction(
-    message: Message
-):
-
-    await message.answer(
-        "Здравствуйте! 👋\n\n"
-        "Теперь пришлите ваше фото в чат.\n\n"
-        "📸 Отправьте <b>одно фото</b> человека, "
-        "и я верну этого же человека, "
-        "но уже в стильном <b>ДРИПЧИКЕ</b> 😎🔥\n\n"
-        "Лучше всего подойдёт фото, где человека "
-        "хорошо видно целиком или по пояс.",
-        parse_mode="HTML"
-    )
+    output.write(encoded.tobytes())
+    return output.getvalue()
 
 
 # ============================================================
 # START
 # ============================================================
 
-@dp.message(
-    CommandStart()
-)
-async def start(
-    message: Message
-):
-
-    if not message.from_user:
-        return
-
-    user_id = message.from_user.id
-
-    log.info(
-        "/start от пользователя %s",
-        user_id
-    )
-
-    # Даже если пользователь проверялся раньше,
-    # повторно проверяем актуальную подписку.
-    subscribed = await check_subscription(
-        user_id
-    )
-
-    if subscribed:
-
-        verified_users.add(
-            user_id
-        )
-
-        await send_photo_instruction(
-            message
-        )
-
-        return
-
-    verified_users.discard(
-        user_id
-    )
-
+@dp.message(CommandStart())
+async def start(message: Message):
     await message.answer(
-        "Здравствуйте! 👋\n\n"
-        "Вначале вам надо подписаться на канал.",
-        reply_markup=subscription_keyboard()
+        "👕 <b>Clothing Layout Bot</b>\n\n"
+        "Отправь мне фото одежды или вещи.\n\n"
+        "Я без ИИ-моделей обработаю изображение, "
+        "уберу обычный фон и размещу вещи на чистом "
+        "белом фоне в каталожном виде.\n\n"
+        "📸 Можно отправить одно фото с одной или "
+        "несколькими вещами."
     )
 
 
 # ============================================================
-# ПРОВЕРКА КНОПКИ
+# PHOTO
 # ============================================================
 
-@dp.callback_query(
-    F.data == "check_subscription"
-)
-async def check_subscription_callback(
-    callback: types.CallbackQuery
-):
-
-    if not callback.from_user:
-        await callback.answer()
+@dp.message(F.photo)
+async def photo_handler(message: Message):
+    if not message.photo:
         return
 
-    user_id = callback.from_user.id
-
-    log.info(
-        "Проверка подписки по кнопке: user=%s",
-        user_id
-    )
-
-    subscribed = await check_subscription(
-        user_id
-    )
-
-    if not subscribed:
-
-        await callback.answer(
-            "❌ Вы ещё не подписались на канал",
-            show_alert=True
-        )
-
-        return
-
-    verified_users.add(
-        user_id
-    )
-
-    await callback.answer(
-        "✅ Подписка подтверждена!"
+    status = await message.answer(
+        "⏳ Обрабатываю фото...\n"
+        "Убираю фон и раскладываю вещи."
     )
 
     try:
-
-        if callback.message:
-
-            await callback.message.edit_text(
-                "Здравствуйте! 👋\n\n"
-                "Теперь пришлите ваше фото в чат.\n\n"
-                "📸 Отправьте <b>одно фото</b> человека, "
-                "и я верну этого же человека, "
-                "но уже в стильном <b>ДРИПЧИКЕ</b> 😎🔥\n\n"
-                "Лучше всего подойдёт фото, где человека "
-                "хорошо видно целиком или по пояс.",
-                parse_mode="HTML"
-            )
-
-    except Exception as e:
-
-        log.exception(
-            "Не удалось изменить сообщение после проверки подписки: %r",
-            e
-        )
-
-        if callback.message:
-
-            await callback.message.answer(
-                "Здравствуйте! 👋\n\n"
-                "Теперь пришлите ваше фото в чат.\n\n"
-                "📸 Отправьте <b>одно фото</b> человека, "
-                "и я верну этого же человека, "
-                "но уже в стильном <b>ДРИПЧИКЕ</b> 😎🔥",
-                parse_mode="HTML"
-            )
-
-
-# ============================================================
-# ПОВТОРНАЯ ПРОВЕРКА ПОДПИСКИ
-# ============================================================
-
-async def require_subscription(
-    message: Message
-) -> bool:
-
-    if not message.from_user:
-        return False
-
-    user_id = message.from_user.id
-
-    subscribed = await check_subscription(
-        user_id
-    )
-
-    if not subscribed:
-
-        verified_users.discard(
-            user_id
-        )
-
-        await message.answer(
-            "❌ Чтобы пользоваться ботом, "
-            "сначала подпишитесь на канал.",
-            reply_markup=subscription_keyboard()
-        )
-
-        return False
-
-    verified_users.add(
-        user_id
-    )
-
-    return True
-
-
-# ============================================================
-# OPENAI IMAGE EDIT
-# ============================================================
-
-async def edit_photo_with_openai(
-    image_bytes: bytes
-) -> bytes:
-
-    prompt = """
-Edit the provided photograph.
-
-MAIN OBJECTIVE:
-Keep the exact same person from the input photograph
-and change ONLY their clothing into a fashionable,
-modern streetwear drip outfit.
-
-IDENTITY PRESERVATION IS EXTREMELY IMPORTANT.
-
-Keep the same:
-- person
-- face
-- facial features
-- eyes
-- nose
-- mouth
-- hairstyle
-- skin tone
-- age
-- body proportions
-- body shape
-- pose
-- hands
-- fingers
-- expression
-- camera angle
-- perspective
-
-Do NOT replace the person with another person.
-
-Do NOT generate a new face.
-
-Do NOT alter the person's identity.
-
-CLOTHING:
-Replace only the original clothing with a premium,
-modern streetwear outfit.
-
-The outfit should look like realistic contemporary
-"drip" fashion.
-
-Use combinations such as:
-- premium oversized hoodie
-- stylish jacket
-- fashionable pants
-- clean modern sneakers
-- tasteful chains or accessories when appropriate
-
-The clothing must naturally fit the person's body,
-pose and perspective.
-
-REALISM:
-The result must look like a real photograph.
-
-Do NOT make it:
-- cartoon
-- anime
-- illustration
-- painting
-- 3D render
-- artificial-looking character
-
-Keep the original background as close as possible.
-
-Keep the original lighting as close as possible.
-
-Keep the original composition and camera perspective.
-
-Do not unnecessarily modify anything except the clothing.
-
-The final result should look like the same photograph
-of the same person, but wearing a stylish premium
-streetwear drip outfit.
-"""
-
-    def make_edit():
-
-        log.info(
-            "Sending image to OpenAI. Bytes=%s",
-            len(image_bytes)
-        )
-
-        image_file = BytesIO(
-            image_bytes
-        )
-
-        # Важно: имя файла помогает SDK определить формат.
-        image_file.name = "person.jpg"
-
-        try:
-
-            result = openai_client.images.edit(
-                model=OPENAI_IMAGE_MODEL,
-                image=image_file,
-                prompt=prompt,
-                size="1024x1024",
-                quality="medium"
-            )
-
-        except Exception as e:
-
-            log.exception(
-                "OpenAI images.edit ERROR: %r",
-                e
-            )
-
-            raise RuntimeError(
-                f"Ошибка OpenAI: {e}"
-            ) from e
-
-        # ====================================================
-        # ПРОВЕРКА ОТВЕТА OPENAI
-        # ====================================================
-
-        if not result:
-
-            raise RuntimeError(
-                "OpenAI вернул пустой response"
-            )
-
-        if not result.data:
-
-            raise RuntimeError(
-                "OpenAI не вернул data"
-            )
-
-        first_result = result.data[0]
-
-        # GPT Image обычно возвращает base64.
-        encoded = getattr(
-            first_result,
-            "b64_json",
-            None
-        )
-
-        if not encoded:
-
-            raise RuntimeError(
-                "OpenAI не вернул b64_json изображения"
-            )
-
-        try:
-
-            decoded = base64.b64decode(
-                encoded
-            )
-
-        except Exception as e:
-
-            log.exception(
-                "Ошибка декодирования base64: %r",
-                e
-            )
-
-            raise RuntimeError(
-                "Не удалось декодировать изображение OpenAI"
-            ) from e
-
-        if not decoded:
-
-            raise RuntimeError(
-                "После декодирования изображение пустое"
-            )
-
-        log.info(
-            "OpenAI image received successfully. Bytes=%s",
-            len(decoded)
-        )
-
-        return decoded
-
-    # Синхронный OpenAI SDK запускаем
-    # в отдельном потоке, чтобы не блокировать Telegram.
-    return await asyncio.to_thread(
-        make_edit
-    )
-
-
-# ============================================================
-# СКАЧИВАНИЕ ФОТО TELEGRAM
-# ============================================================
-
-async def download_telegram_photo(
-    file_id: str
-) -> bytes:
-
-    log.info(
-        "Получение Telegram file: %s",
-        file_id
-    )
-
-    telegram_file = await bot.get_file(
-        file_id
-    )
-
-    if not telegram_file.file_path:
-
-        raise RuntimeError(
-            "Telegram не вернул file_path"
-        )
-
-    photo_buffer = BytesIO()
-
-    await bot.download_file(
-        telegram_file.file_path,
-        destination=photo_buffer
-    )
-
-    source_bytes = (
-        photo_buffer.getvalue()
-    )
-
-    if not source_bytes:
-
-        raise RuntimeError(
-            "Telegram скачал пустой файл"
-        )
-
-    log.info(
-        "Telegram photo downloaded. Bytes=%s",
-        len(source_bytes)
-    )
-
-    return source_bytes
-
-
-# ============================================================
-# ФОТО
-# ============================================================
-
-@dp.message(
-    F.photo
-)
-async def photo_handler(
-    message: Message
-):
-
-    if not message.from_user:
-        return
-
-    user_id = message.from_user.id
-
-    log.info(
-        "Получено фото от user=%s",
-        user_id
-    )
-
-    # ========================================================
-    # ПРОВЕРКА ПОДПИСКИ
-    # ========================================================
-
-    if not await require_subscription(
-        message
-    ):
-        return
-
-    # ========================================================
-    # ЗАЩИТА ОТ ДВОЙНОЙ ОБРАБОТКИ
-    # ========================================================
-
-    if user_id in processing_users:
-
-        await message.answer(
-            "⏳ Я ещё обрабатываю ваше предыдущее фото.\n\n"
-            "Пожалуйста, дождитесь результата."
-        )
-
-        return
-
-    processing_users.add(
-        user_id
-    )
-
-    try:
-
-        # ====================================================
-        # СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЮ
-        # ====================================================
-
-        await message.answer(
-            "⏳ <b>Получил фото!</b>\n\n"
-            "👕 Подбираю тебе <b>ДРИПЧИК</b>...\n"
-            "🔥 Наношу новый образ.\n\n"
-            "Это может занять некоторое время.",
-            parse_mode="HTML"
-        )
-
-        # ====================================================
-        # БЕРЁМ САМОЕ КАЧЕСТВЕННОЕ ФОТО
-        # ====================================================
-
         photo = message.photo[-1]
 
-        log.info(
-            "Telegram photo selected: "
-            "file_id=%s width=%s height=%s size=%s",
-            photo.file_id,
-            photo.width,
-            photo.height,
-            photo.file_size
-        )
-
-        # ====================================================
-        # СКАЧИВАЕМ ФОТО
-        # ====================================================
-
-        source_bytes = await download_telegram_photo(
+        telegram_file = await bot.get_file(
             photo.file_id
         )
 
-        # ====================================================
-        # OPENAI
-        # ====================================================
+        source = BytesIO()
 
-        log.info(
-            "Начинаю обработку OpenAI для user=%s",
-            user_id
+        await bot.download_file(
+            telegram_file.file_path,
+            destination=source
         )
 
-        edited_bytes = await edit_photo_with_openai(
-            source_bytes
+        image_bytes = source.getvalue()
+
+        if not image_bytes:
+            raise RuntimeError("Пустой файл изображения")
+
+        image = decode_image(image_bytes)
+
+        result = await asyncio.to_thread(
+            make_catalog_image,
+            image
         )
-
-        # ====================================================
-        # ПРОВЕРКА РЕЗУЛЬТАТА
-        # ====================================================
-
-        if not edited_bytes:
-
-            raise RuntimeError(
-                "OpenAI вернул пустой результат"
-            )
-
-        log.info(
-            "Обработка завершена для user=%s. "
-            "Result bytes=%s",
-            user_id,
-            len(edited_bytes)
-        )
-
-        # ====================================================
-        # ОТПРАВЛЯЕМ ФОТО
-        # ====================================================
 
         await message.answer_photo(
             photo=types.BufferedInputFile(
-                edited_bytes,
-                filename="drip.png"
+                result,
+                filename="clothing_catalog.jpg"
             ),
             caption=(
-                "🔥 <b>Вот твой ДРИПЧИК!</b>\n\n"
-                "😎 Образ обновлён."
-            ),
-            parse_mode="HTML"
+                "✅ Готово!\n\n"
+                "👕 Вещи размещены на белом фоне.\n"
+                "Без генерации изображения и без AI-модели."
+            )
         )
 
-        log.info(
-            "Результат успешно отправлен user=%s",
-            user_id
-        )
+        try:
+            await status.delete()
+        except Exception:
+            pass
 
     except Exception as e:
-
-        # ====================================================
-        # ПОЛНЫЙ ЛОГ ОШИБКИ
-        # ====================================================
-
         log.exception(
-            "Image processing error for user=%s: %r",
-            user_id,
+            "Ошибка обработки фото: %s",
             e
         )
 
-        # ====================================================
-        # СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЮ
-        # ====================================================
-
         await message.answer(
-            "❌ <b>Не получилось обработать фото.</b>\n\n"
-            "Попробуйте отправить другое фото, "
-            "где человека хорошо видно.\n\n"
-            "Если ошибка повторяется, попробуйте "
-            "ещё раз через некоторое время.",
-            parse_mode="HTML"
-        )
-
-    finally:
-
-        processing_users.discard(
-            user_id
-        )
-
-        log.info(
-            "Processing lock released for user=%s",
-            user_id
+            "❌ Не удалось обработать фото.\n\n"
+            "Попробуй отправить более чёткое фото, "
+            "желательно с хорошо отделённой от фона одеждой."
         )
 
 
 # ============================================================
-# НЕ ФОТО
+# OTHER
 # ============================================================
 
 @dp.message()
-async def other_message(
-    message: Message
-):
-
-    if not message.from_user:
-        return
-
-    if not await require_subscription(
-        message
-    ):
-        return
-
+async def other_message(message: Message):
     await message.answer(
-        "📸 Пришлите именно <b>одно фото</b> человека.\n\n"
-        "После этого я сделаю ему стильный "
-        "<b>ДРИПЧИК</b> 😎🔥",
-        parse_mode="HTML"
+        "📸 Отправь мне фото одежды.\n\n"
+        "Я размещу вещи на чистом белом фоне."
     )
 
 
@@ -777,83 +770,16 @@ async def other_message(
 # ============================================================
 
 async def main():
-
-    log.info(
-        "========================================"
-    )
-
-    log.info(
-        "🐻‍❄️ WHITE BEAR DRIP BOT"
-    )
-
-    log.info(
-        "========================================"
-    )
-
-    log.info(
-        "Channel: %s",
-        CHANNEL_USERNAME
-    )
-
-    log.info(
-        "OpenAI image model: %s",
-        OPENAI_IMAGE_MODEL
-    )
-
-    log.info(
-        "Bot starting..."
-    )
-
-    # Удаляем старый webhook перед polling.
-    # Это предотвращает конфликт webhook/polling.
-    try:
-
-        await bot.delete_webhook(
-            drop_pending_updates=False
-        )
-
-        log.info(
-            "Webhook removed successfully"
-        )
-
-    except Exception as e:
-
-        log.exception(
-            "Не удалось удалить webhook: %r",
-            e
-        )
-
-    # ========================================================
-    # START POLLING
-    # ========================================================
-
+    log.info("👕 Clothing Layout Bot starting...")
+    log.info("AI image generation: OFF")
     await dp.start_polling(
         bot,
         allowed_updates=dp.resolve_used_update_types()
     )
 
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
-
 if __name__ == "__main__":
-
     try:
-
-        asyncio.run(
-            main()
-        )
-
+        asyncio.run(main())
     except KeyboardInterrupt:
-
-        log.info(
-            "Bot stopped"
-        )
-
-    except Exception as e:
-
-        log.exception(
-            "Fatal bot error: %r",
-            e
-        )
+        log.info("Bot stopped")
