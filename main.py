@@ -21,11 +21,8 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в Secrets")
 
 
-# Размер готовой картинки
 CANVAS_SIZE = 1200
-
-# Максимальный размер входной картинки для обработки
-MAX_INPUT_SIZE = 1600
+MAX_IMAGE_SIZE = 1600
 
 
 # ============================================================
@@ -33,7 +30,7 @@ MAX_INPUT_SIZE = 1600
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("clothing-layout-bot")
+log = logging.getLogger("clothing-extractor")
 
 
 # ============================================================
@@ -45,58 +42,139 @@ dp = Dispatcher()
 
 
 # ============================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ЗАГРУЗКА ИЗОБРАЖЕНИЯ
 # ============================================================
 
-def resize_for_processing(img: np.ndarray) -> np.ndarray:
-    h, w = img.shape[:2]
-    longest = max(h, w)
+def decode_image(data: bytes):
+    array = np.frombuffer(data, dtype=np.uint8)
 
-    if longest <= MAX_INPUT_SIZE:
-        return img
-
-    scale = MAX_INPUT_SIZE / longest
-    return cv2.resize(
-        img,
-        (int(w * scale), int(h * scale)),
-        interpolation=cv2.INTER_AREA
+    image = cv2.imdecode(
+        array,
+        cv2.IMREAD_COLOR
     )
-
-
-def decode_image(data: bytes) -> np.ndarray:
-    arr = np.frombuffer(data, dtype=np.uint8)
-    image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
     if image is None:
         raise ValueError("Не удалось открыть изображение")
 
-    return resize_for_processing(image)
+    h, w = image.shape[:2]
+
+    largest = max(h, w)
+
+    if largest > MAX_IMAGE_SIZE:
+
+        scale = MAX_IMAGE_SIZE / largest
+
+        image = cv2.resize(
+            image,
+            (
+                int(w * scale),
+                int(h * scale)
+            ),
+            interpolation=cv2.INTER_AREA
+        )
+
+    return image
 
 
-def white_background_mask(image: np.ndarray) -> np.ndarray:
-    """
-    Полностью обычная компьютерная обработка:
-    ищем пиксели, близкие к белому, и считаем их фоном.
-    Никаких AI/нейросетей здесь нет.
-    """
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+# ============================================================
+# ОПРЕДЕЛЕНИЕ СВЕТЛОГО ФОНА
+# ============================================================
 
-    # Белый/очень светлый фон
-    white = cv2.inRange(
+def create_background_mask(image):
+
+    hsv = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2HSV
+    )
+
+    lower = np.array(
+        [0, 0, 200],
+        dtype=np.uint8
+    )
+
+    upper = np.array(
+        [180, 75, 255],
+        dtype=np.uint8
+    )
+
+    mask = cv2.inRange(
         hsv,
-        np.array([0, 0, 205], dtype=np.uint8),
-        np.array([180, 70, 255], dtype=np.uint8)
+        lower,
+        upper
     )
 
-    foreground = 255 - white
+    return mask
 
-    kernel = np.ones((5, 5), np.uint8)
-    foreground = cv2.morphologyEx(
-        foreground,
+
+# ============================================================
+# КОЖА
+# ============================================================
+
+def create_skin_mask(image):
+
+    hsv = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2HSV
+    )
+
+    # Приближённое определение оттенков кожи.
+    # Это обычная обработка OpenCV, не AI.
+    lower = np.array(
+        [0, 20, 45],
+        dtype=np.uint8
+    )
+
+    upper = np.array(
+        [35, 255, 255],
+        dtype=np.uint8
+    )
+
+    mask = cv2.inRange(
+        hsv,
+        lower,
+        upper
+    )
+
+    kernel = np.ones(
+        (7, 7),
+        np.uint8
+    )
+
+    mask = cv2.morphologyEx(
+        mask,
         cv2.MORPH_OPEN,
-        kernel,
-        iterations=1
+        kernel
     )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        kernel
+    )
+
+    return mask
+
+
+# ============================================================
+# СИЛУЭТ ЧЕЛОВЕКА
+# ============================================================
+
+def create_person_mask(image):
+
+    h, w = image.shape[:2]
+
+    background = create_background_mask(
+        image
+    )
+
+    foreground = 255 - background
+
+    # Убираем мелкий шум
+    kernel = np.ones(
+        (9, 9),
+        np.uint8
+    )
+
     foreground = cv2.morphologyEx(
         foreground,
         cv2.MORPH_CLOSE,
@@ -104,30 +182,15 @@ def white_background_mask(image: np.ndarray) -> np.ndarray:
         iterations=2
     )
 
-    # Убираем мелкий мусор
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+    foreground = cv2.morphologyEx(
         foreground,
-        connectivity=8
+        cv2.MORPH_OPEN,
+        kernel
     )
 
-    clean = np.zeros_like(foreground)
-    image_area = image.shape[0] * image.shape[1]
-    min_area = max(150, int(image_area * 0.0015))
-
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area >= min_area:
-            clean[labels == i] = 255
-
-    return clean
-
-
-def grabcut_mask(image: np.ndarray) -> np.ndarray:
-    """
-    Запасной вариант без AI.
-    OpenCV GrabCut использует классический алгоритм сегментации.
-    """
-    h, w = image.shape[:2]
+    # ========================================================
+    # GRABCUT
+    # ========================================================
 
     mask = np.full(
         (h, w),
@@ -135,63 +198,140 @@ def grabcut_mask(image: np.ndarray) -> np.ndarray:
         dtype=np.uint8
     )
 
-    # Уверенный фон по краям
-    border = max(5, min(h, w) // 35)
+    border = max(
+        5,
+        min(h, w) // 30
+    )
+
     mask[:border, :] = cv2.GC_BGD
     mask[-border:, :] = cv2.GC_BGD
     mask[:, :border] = cv2.GC_BGD
     mask[:, -border:] = cv2.GC_BGD
 
-    # Центральная область — вероятный объект
+    # Центральная область предполагается человеком
     x1 = int(w * 0.08)
-    y1 = int(h * 0.06)
+    y1 = int(h * 0.03)
     x2 = int(w * 0.92)
-    y2 = int(h * 0.94)
+    y2 = int(h * 0.98)
 
-    mask[y1:y2, x1:x2] = cv2.GC_PR_FGD
+    mask[
+        y1:y2,
+        x1:x2
+    ] = cv2.GC_PR_FGD
 
-    # Если фон почти белый, сразу считаем непохожие на белый
-    # пиксели вероятным передним планом.
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    not_white = cv2.inRange(
-        hsv,
-        np.array([0, 35, 20], dtype=np.uint8),
-        np.array([180, 255, 240], dtype=np.uint8)
+    # Пиксели, явно отличающиеся от белого,
+    # считаем вероятным объектом
+    mask[
+        foreground > 0
+    ] = cv2.GC_PR_FGD
+
+    bg_model = np.zeros(
+        (1, 65),
+        np.float64
     )
 
-    mask[not_white > 0] = cv2.GC_PR_FGD
-
-    bgd_model = np.zeros((1, 65), np.float64)
-    fgd_model = np.zeros((1, 65), np.float64)
+    fg_model = np.zeros(
+        (1, 65),
+        np.float64
+    )
 
     try:
+
         cv2.grabCut(
             image,
             mask,
             None,
-            bgd_model,
-            fgd_model,
+            bg_model,
+            fg_model,
             5,
             cv2.GC_INIT_WITH_MASK
         )
+
     except cv2.error:
-        # Если GrabCut не смог обработать фото,
-        # возвращаем простую маску.
-        return not_white
+
+        return foreground
 
     result = np.where(
-        (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD),
+        (
+            (mask == cv2.GC_FGD) |
+            (mask == cv2.GC_PR_FGD)
+        ),
         255,
         0
     ).astype(np.uint8)
 
-    kernel = np.ones((5, 5), np.uint8)
+    return result
+
+
+# ============================================================
+# УДАЛЕНИЕ ГОЛОВЫ И ОТКРЫТЫХ УЧАСТКОВ ТЕЛА
+# ============================================================
+
+def remove_body_parts(
+    image,
+    mask
+):
+
+    h, w = image.shape[:2]
+
+    result = mask.copy()
+
+    # --------------------------------------------------------
+    # Верхняя часть головы
+    # --------------------------------------------------------
+
+    head_end = int(h * 0.18)
+
+    result[
+        0:head_end,
+        :
+    ] = 0
+
+    # --------------------------------------------------------
+    # Края — часто руки/фон
+    # --------------------------------------------------------
+
+    side = int(w * 0.05)
+
+    result[
+        :,
+        0:side
+    ] = 0
+
+    result[
+        :,
+        w-side:w
+    ] = 0
+
+    # --------------------------------------------------------
+    # Кожа
+    # --------------------------------------------------------
+
+    skin = create_skin_mask(
+        image
+    )
+
+    # Удаляем кожу только там,
+    # где она занимает заметную область.
+    result[
+        skin > 0
+    ] = 0
+
+    # --------------------------------------------------------
+    # Сглаживаем маску
+    # --------------------------------------------------------
+
+    kernel = np.ones(
+        (7, 7),
+        np.uint8
+    )
+
     result = cv2.morphologyEx(
         result,
         cv2.MORPH_OPEN,
-        kernel,
-        iterations=1
+        kernel
     )
+
     result = cv2.morphologyEx(
         result,
         cv2.MORPH_CLOSE,
@@ -202,310 +342,430 @@ def grabcut_mask(image: np.ndarray) -> np.ndarray:
     return result
 
 
-def build_foreground(image: np.ndarray):
-    """
-    Получаем одежду/предмет без фона.
-    """
-    mask = white_background_mask(image)
+# ============================================================
+# ПОИСК ОБЛАСТЕЙ ОДЕЖДЫ
+# ============================================================
 
-    image_area = image.shape[0] * image.shape[1]
-    mask_area = cv2.countNonZero(mask)
+def find_components(mask):
 
-    # Если простая обработка нашла слишком мало/много,
-    # используем классический GrabCut.
-    ratio = mask_area / max(1, image_area)
-
-    if ratio < 0.01 or ratio > 0.92:
-        mask = grabcut_mask(image)
-
-    # Ещё раз чистим маску
-    kernel = np.ones((7, 7), np.uint8)
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        kernel,
-        iterations=2
-    )
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_OPEN,
-        kernel,
-        iterations=1
-    )
-
-    # Оставляем достаточно крупные области.
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        mask,
-        connectivity=8
+    num_labels, labels, stats, centers = (
+        cv2.connectedComponentsWithStats(
+            mask,
+            connectivity=8
+        )
     )
 
     components = []
-    min_area = max(300, int(image_area * 0.002))
+
+    image_area = (
+        mask.shape[0] *
+        mask.shape[1]
+    )
+
+    min_area = max(
+        500,
+        int(image_area * 0.003)
+    )
 
     for i in range(1, num_labels):
-        x = stats[i, cv2.CC_STAT_LEFT]
-        y = stats[i, cv2.CC_STAT_TOP]
-        w = stats[i, cv2.CC_STAT_WIDTH]
-        h = stats[i, cv2.CC_STAT_HEIGHT]
-        area = stats[i, cv2.CC_STAT_AREA]
+
+        x = stats[
+            i,
+            cv2.CC_STAT_LEFT
+        ]
+
+        y = stats[
+            i,
+            cv2.CC_STAT_TOP
+        ]
+
+        w = stats[
+            i,
+            cv2.CC_STAT_WIDTH
+        ]
+
+        h = stats[
+            i,
+            cv2.CC_STAT_HEIGHT
+        ]
+
+        area = stats[
+            i,
+            cv2.CC_STAT_AREA
+        ]
 
         if area < min_area:
             continue
 
-        # Не берём огромную область, если это почти весь кадр:
-        # GrabCut/фон мог слиться с предметом.
-        component_mask = np.where(labels == i, 255, 0).astype(np.uint8)
-
-        pad = max(4, int(min(w, h) * 0.025))
-        x1 = max(0, x - pad)
-        y1 = max(0, y - pad)
-        x2 = min(image.shape[1], x + w + pad)
-        y2 = min(image.shape[0], y + h + pad)
-
-        crop = image[y1:y2, x1:x2]
-        crop_mask = component_mask[y1:y2, x1:x2]
+        component_mask = np.where(
+            labels == i,
+            255,
+            0
+        ).astype(np.uint8)
 
         components.append({
-            "image": crop,
-            "mask": crop_mask,
             "x": x,
             "y": y,
             "w": w,
             "h": h,
-            "area": area
+            "area": area,
+            "mask": component_mask
         })
 
-    # Если отдельных объектов много, оставляем самые крупные.
-    components.sort(key=lambda c: c["area"], reverse=True)
-    components = components[:8]
-
-    if not components:
-        # Последний вариант: считаем весь предмет центральным.
-        return [{
-            "image": image,
-            "mask": np.ones(
-                image.shape[:2],
-                dtype=np.uint8
-            ) * 255,
-            "x": 0,
-            "y": 0,
-            "w": image.shape[1],
-            "h": image.shape[0],
-            "area": image.shape[0] * image.shape[1]
-        }]
+    components.sort(
+        key=lambda x: x["area"],
+        reverse=True
+    )
 
     return components
 
 
-def object_type(component) -> str:
-    """
-    Простая геометрическая классификация.
-    Это НЕ AI.
-    Нужна только для аккуратной раскладки вещей.
-    """
+# ============================================================
+# ПОЛУЧЕНИЕ ОБЪЕКТА
+# ============================================================
+
+def extract_component(
+    image,
+    component
+):
+
+    x = component["x"]
+    y = component["y"]
     w = component["w"]
     h = component["h"]
-    area = component["area"]
 
-    ratio = w / max(1, h)
-    canvas_area = component["image"].shape[0] * component["image"].shape[1]
-    fill = area / max(1, canvas_area)
+    padding = max(
+        5,
+        int(min(w, h) * 0.03)
+    )
 
-    # Длинный вертикальный объект — брюки/штаны.
-    if ratio < 0.62 and h > w * 1.35:
+    x1 = max(
+        0,
+        x - padding
+    )
+
+    y1 = max(
+        0,
+        y - padding
+    )
+
+    x2 = min(
+        image.shape[1],
+        x + w + padding
+    )
+
+    y2 = min(
+        image.shape[0],
+        y + h + padding
+    )
+
+    crop = image[
+        y1:y2,
+        x1:x2
+    ]
+
+    crop_mask = component["mask"][
+        y1:y2,
+        x1:x2
+    ]
+
+    # Сглаживание края
+    crop_mask = cv2.GaussianBlur(
+        crop_mask,
+        (5, 5),
+        0
+    )
+
+    rgba = cv2.cvtColor(
+        crop,
+        cv2.COLOR_BGR2BGRA
+    )
+
+    rgba[:, :, 3] = crop_mask
+
+    return rgba
+
+
+# ============================================================
+# ОПРЕДЕЛЕНИЕ ПОЛОЖЕНИЯ ПРЕДМЕТА
+# ============================================================
+
+def classify_component(component):
+
+    w = component["w"]
+    h = component["h"]
+
+    ratio = w / max(
+        1,
+        h
+    )
+
+    # Длинный вертикальный объект
+    # скорее всего штаны
+    if (
+        h > w * 1.35
+        and ratio < 0.75
+    ):
         return "pants"
 
-    # Маленький вытянутый объект — чаще обувь/аксессуар.
-    if ratio > 1.35 and h < w * 0.75:
-        return "shoes"
-
-    # Небольшой компактный объект — аксессуар.
-    if fill < 0.18 and max(w, h) < 0.45 * max(
-        component["image"].shape[0],
-        component["image"].shape[1]
+    # Широкий невысокий объект
+    # скорее всего обувь
+    if (
+        ratio > 1.25
+        and h < w * 0.75
     ):
-        return "accessory"
+        return "shoes"
 
     return "top"
 
 
-def add_shadow(canvas: np.ndarray, x: int, y: int, w: int, h: int):
-    """
-    Лёгкая тень под предметом для аккуратного каталожного вида.
-    """
-    overlay = canvas.copy()
+# ============================================================
+# ПОДГОНКА ПОД РАЗМЕР
+# ============================================================
 
-    cx = x + w // 2
-    cy = y + h - max(8, h // 35)
+def fit_object(
+    rgba,
+    max_width,
+    max_height
+):
 
-    axes = (
-        max(10, w // 3),
-        max(5, h // 18)
-    )
-
-    cv2.ellipse(
-        overlay,
-        (cx, cy),
-        axes,
-        0,
-        0,
-        360,
-        (225, 225, 225),
-        -1
-    )
-
-    overlay = cv2.GaussianBlur(
-        overlay,
-        (0, 0),
-        12
-    )
-
-    # Тень очень слабая
-    canvas[:] = cv2.addWeighted(
-        canvas,
-        0.88,
-        overlay,
-        0.12,
-        0
-    )
-
-
-def fit_rgba_to_box(
-    rgba: np.ndarray,
-    box_w: int,
-    box_h: int
-) -> np.ndarray:
     h, w = rgba.shape[:2]
 
     scale = min(
-        box_w / max(1, w),
-        box_h / max(1, h)
+        max_width / max(1, w),
+        max_height / max(1, h)
     )
 
-    nw = max(1, int(w * scale))
-    nh = max(1, int(h * scale))
+    new_w = max(
+        1,
+        int(w * scale)
+    )
+
+    new_h = max(
+        1,
+        int(h * scale)
+    )
 
     return cv2.resize(
         rgba,
-        (nw, nh),
+        (new_w, new_h),
         interpolation=cv2.INTER_AREA
     )
 
 
+# ============================================================
+# ВСТАВКА RGBA
+# ============================================================
+
 def paste_rgba(
-    canvas: np.ndarray,
-    rgba: np.ndarray,
-    x: int,
-    y: int
+    canvas,
+    rgba,
+    x,
+    y
 ):
-    """
-    Накладывает PNG-подобный RGBA объект на белый фон.
-    """
+
     h, w = rgba.shape[:2]
 
-    if x >= canvas.shape[1] or y >= canvas.shape[0]:
+    x1 = max(
+        0,
+        x
+    )
+
+    y1 = max(
+        0,
+        y
+    )
+
+    x2 = min(
+        canvas.shape[1],
+        x + w
+    )
+
+    y2 = min(
+        canvas.shape[0],
+        y + h
+    )
+
+    if x1 >= x2 or y1 >= y2:
         return
 
-    x1 = max(0, x)
-    y1 = max(0, y)
-    x2 = min(canvas.shape[1], x + w)
-    y2 = min(canvas.shape[0], y + h)
-
-    if x2 <= x1 or y2 <= y1:
-        return
-
-    src = rgba[
-        y1 - y:y2 - y,
-        x1 - x:x2 - x
+    source = rgba[
+        y1-y:y2-y,
+        x1-x:x2-x
     ]
 
     alpha = (
-        src[:, :, 3:4].astype(np.float32) / 255.0
+        source[:, :, 3:4]
+        .astype(np.float32)
+        / 255.0
     )
 
-    rgb = src[:, :, :3].astype(np.float32)
-    dst = canvas[y1:y2, x1:x2].astype(np.float32)
+    foreground = (
+        source[:, :, :3]
+        .astype(np.float32)
+    )
+
+    background = (
+        canvas[y1:y2, x1:x2]
+        .astype(np.float32)
+    )
 
     result = (
-        rgb * alpha +
-        dst * (1.0 - alpha)
+        foreground * alpha
+        +
+        background * (1-alpha)
     )
 
-    canvas[y1:y2, x1:x2] = np.clip(
+    canvas[
+        y1:y2,
+        x1:x2
+    ] = np.clip(
         result,
         0,
         255
     ).astype(np.uint8)
 
 
-def component_to_rgba(component):
-    image = component["image"]
-    mask = component["mask"]
+# ============================================================
+# СОЗДАНИЕ ФИНАЛЬНОЙ КАРТИНКИ
+# ============================================================
 
-    # Небольшое сглаживание краёв.
-    alpha = cv2.GaussianBlur(
-        mask,
-        (5, 5),
-        0
+def create_catalog(
+    image
+):
+
+    # Получаем силуэт
+    person_mask = create_person_mask(
+        image
     )
 
-    bgr = image
-    rgba = cv2.cvtColor(
-        bgr,
-        cv2.COLOR_BGR2BGRA
+    # Убираем голову/кожу
+    clothing_mask = remove_body_parts(
+        image,
+        person_mask
     )
-    rgba[:, :, 3] = alpha
 
-    return rgba
+    # Ищем крупные отдельные области
+    components = find_components(
+        clothing_mask
+    )
 
+    if not components:
 
-def make_catalog_image(image: np.ndarray) -> bytes:
-    """
-    Основная функция.
+        raise RuntimeError(
+            "Не удалось найти одежду"
+        )
 
-    Если на фото одна вещь:
-        она аккуратно помещается на белый фон.
+    # Берём максимум 6 крупных элементов
+    components = components[:6]
 
-    Если на фото несколько раздельных вещей:
-        они раскладываются по категориям:
-        верх / низ / обувь / аксессуары.
+    items = []
 
-    Никакой генерации изображения и никакой AI-модели.
-    """
-    components = build_foreground(image)
-
-    typed = []
     for component in components:
-        component["type"] = object_type(component)
-        typed.append(component)
 
-    # Сортируем так, чтобы крупные предметы были основными.
-    typed.sort(
-        key=lambda c: c["area"],
-        reverse=True
+        item_type = classify_component(
+            component
+        )
+
+        rgba = extract_component(
+            image,
+            component
+        )
+
+        items.append({
+            "type": item_type,
+            "rgba": rgba,
+            "component": component
+        })
+
+    # ========================================================
+    # ИЩЕМ:
+    # TOP
+    # PANTS
+    # SHOES
+    # ========================================================
+
+    tops = [
+        x for x in items
+        if x["type"] == "top"
+    ]
+
+    pants = [
+        x for x in items
+        if x["type"] == "pants"
+    ]
+
+    shoes = [
+        x for x in items
+        if x["type"] == "shoes"
+    ]
+
+    # Если классификатор не смог найти штаны,
+    # используем самый высокий вертикальный объект.
+    if not pants:
+
+        vertical = [
+            x for x in items
+            if x["component"]["h"]
+            >
+            x["component"]["w"]
+        ]
+
+        if vertical:
+
+            vertical.sort(
+                key=lambda x: x["component"]["area"],
+                reverse=True
+            )
+
+            pants = [
+                vertical[0]
+            ]
+
+            if vertical[0] in tops:
+                tops.remove(
+                    vertical[0]
+                )
+
+    # ========================================================
+    # БЕЛЫЙ ФОН
+    # ========================================================
+
+    canvas = np.full(
+        (
+            CANVAS_SIZE,
+            CANVAS_SIZE,
+            3
+        ),
+        255,
+        dtype=np.uint8
     )
 
-    # Если найден только один предмет — не меняем его
-    # положение/ориентацию, просто делаем красивый белый фон.
-    if len(typed) == 1:
-        comp = typed[0]
-        rgba = component_to_rgba(comp)
+    # ========================================================
+    # ВЕРХ
+    # ========================================================
 
-        # Максимальная зона для одной вещи.
-        rgba = fit_rgba_to_box(
-            rgba,
-            820,
-            980
+    if tops:
+
+        top = tops[0]
+
+        rgba = fit_object(
+            top["rgba"],
+            600,
+            480
         )
 
-        canvas = np.full(
-            (CANVAS_SIZE, CANVAS_SIZE, 3),
-            255,
-            dtype=np.uint8
+        x = (
+            40
+            +
+            (540 - rgba.shape[1]) // 2
         )
 
-        x = (CANVAS_SIZE - rgba.shape[1]) // 2
-        y = (CANVAS_SIZE - rgba.shape[0]) // 2
+        y = (
+            40
+            +
+            (480 - rgba.shape[0]) // 2
+        )
 
         paste_rgba(
             canvas,
@@ -514,142 +774,120 @@ def make_catalog_image(image: np.ndarray) -> bytes:
             y
         )
 
-    else:
-        # Каталожная раскладка.
-        # Верх: одежда/аксессуары.
-        # Низ: штаны/обувь.
-        canvas = np.full(
-            (CANVAS_SIZE, CANVAS_SIZE, 3),
-            255,
-            dtype=np.uint8
+    # ========================================================
+    # ШТАНЫ
+    #
+    # ВАЖНО:
+    # штаны находятся ПОД верхом.
+    # ========================================================
+
+    if pants:
+
+        pant = pants[0]
+
+        rgba = fit_object(
+            pant["rgba"],
+            500,
+            570
         )
 
-        tops = [
-            c for c in typed
-            if c["type"] == "top"
+        x = (
+            60
+            +
+            (500 - rgba.shape[1]) // 2
+        )
+
+        y = (
+            525
+            +
+            (570 - rgba.shape[0]) // 2
+        )
+
+        paste_rgba(
+            canvas,
+            rgba,
+            x,
+            y
+        )
+
+    # ========================================================
+    # КРОССОВКИ
+    #
+    # Возле штанов справа.
+    # ========================================================
+
+    if shoes:
+
+        shoe = shoes[0]
+
+        rgba = fit_object(
+            shoe["rgba"],
+            500,
+            360
+        )
+
+        x = (
+            650
+            +
+            (500 - rgba.shape[1]) // 2
+        )
+
+        y = (
+            620
+            +
+            (360 - rgba.shape[0]) // 2
+        )
+
+        paste_rgba(
+            canvas,
+            rgba,
+            x,
+            y
+        )
+
+    # Если кроссовки не распознаны,
+    # дополнительные предметы можно разместить справа.
+    if not shoes:
+
+        remaining = [
+            x for x in items
+            if x not in tops[:1]
+            and x not in pants[:1]
         ]
-        pants = [
-            c for c in typed
-            if c["type"] == "pants"
-        ]
-        shoes = [
-            c for c in typed
-            if c["type"] == "shoes"
-        ]
-        accessories = [
-            c for c in typed
-            if c["type"] == "accessory"
-        ]
 
-        # Если классификация неидеальна, крупные предметы
-        # всё равно будут показаны.
-        if not tops:
-            tops = typed[:1]
+        if remaining:
 
-        # ---- ВЕРХ ----
-        top_positions = [
-            (55, 55, 520, 450),
-            (625, 55, 520, 450),
-        ]
+            item = remaining[0]
 
-        top_items = tops[:2] + accessories[:1]
-
-        # Если аксессуар есть, стараемся поставить его справа сверху.
-        for index, comp in enumerate(top_items[:2]):
-            box = top_positions[index]
-
-            rgba = component_to_rgba(comp)
-            rgba = fit_rgba_to_box(
-                rgba,
-                box[2],
-                box[3]
-            )
-
-            x = box[0] + (box[2] - rgba.shape[1]) // 2
-            y = box[1] + (box[3] - rgba.shape[0]) // 2
-
-            paste_rgba(canvas, rgba, x, y)
-
-        # ---- НИЗ / ШТАНЫ ----
-        if pants:
-            comp = pants[0]
-            rgba = component_to_rgba(comp)
-            rgba = fit_rgba_to_box(
-                rgba,
+            rgba = fit_object(
+                item["rgba"],
                 500,
-                570
+                360
             )
 
-            x = 70 + (500 - rgba.shape[1]) // 2
-            y = 545 + (570 - rgba.shape[0]) // 2
+            x = (
+                650
+                +
+                (500 - rgba.shape[1]) // 2
+            )
 
-            paste_rgba(canvas, rgba, x, y)
+            y = (
+                620
+                +
+                (360 - rgba.shape[0]) // 2
+            )
 
-        # ---- ОБУВЬ ----
-        shoe_items = shoes[:2]
-
-        if shoe_items:
-            if len(shoe_items) == 1:
-                boxes = [(650, 600, 470, 360)]
-            else:
-                boxes = [
-                    (620, 610, 250, 330),
-                    (850, 610, 250, 330)
-                ]
-
-            for index, comp in enumerate(shoe_items):
-                box = boxes[index]
-
-                rgba = component_to_rgba(comp)
-                rgba = fit_rgba_to_box(
-                    rgba,
-                    box[2],
-                    box[3]
-                )
-
-                x = box[0] + (box[2] - rgba.shape[1]) // 2
-                y = box[1] + (box[3] - rgba.shape[0]) // 2
-
-                paste_rgba(canvas, rgba, x, y)
-
-        # ---- ДОПОЛНИТЕЛЬНЫЕ ПРЕДМЕТЫ ----
-        # Если осталось несколько крупных предметов,
-        # размещаем их в свободной зоне без изменения содержимого.
-        used_ids = set(
-            id(x) for x in top_items[:2] + pants[:1] + shoe_items
-        )
-
-        leftovers = [
-            c for c in typed
-            if id(c) not in used_ids
-        ][:3]
-
-        free_boxes = [
-            (40, 940, 340, 210),
-            (430, 940, 340, 210),
-            (820, 940, 340, 210),
-        ]
-
-        for index, comp in enumerate(leftovers):
-            if index >= len(free_boxes):
-                break
-
-            box = free_boxes[index]
-
-            rgba = component_to_rgba(comp)
-            rgba = fit_rgba_to_box(
+            paste_rgba(
+                canvas,
                 rgba,
-                box[2],
-                box[3]
+                x,
+                y
             )
 
-            x = box[0] + (box[2] - rgba.shape[1]) // 2
-            y = box[1] + (box[3] - rgba.shape[0]) // 2
+    # ========================================================
+    # СОХРАНЕНИЕ
+    # ========================================================
 
-            paste_rgba(canvas, rgba, x, y)
-
-    # Сохраняем JPEG.
-    output = BytesIO()
     success, encoded = cv2.imencode(
         ".jpg",
         canvas,
@@ -660,78 +898,99 @@ def make_catalog_image(image: np.ndarray) -> bytes:
     )
 
     if not success:
-        raise RuntimeError("Не удалось создать итоговое изображение")
 
-    output.write(encoded.tobytes())
-    return output.getvalue()
+        raise RuntimeError(
+            "Не удалось сохранить изображение"
+        )
+
+    return encoded.tobytes()
 
 
 # ============================================================
 # START
 # ============================================================
 
-@dp.message(CommandStart())
-async def start(message: Message):
+@dp.message(
+    CommandStart()
+)
+async def start(
+    message: Message
+):
+
     await message.answer(
-        "👕 <b>Clothing Layout Bot</b>\n\n"
-        "Отправь мне фото одежды или вещи.\n\n"
-        "Я без ИИ-моделей обработаю изображение, "
-        "уберу обычный фон и размещу вещи на чистом "
-        "белом фоне в каталожном виде.\n\n"
-        "📸 Можно отправить одно фото с одной или "
-        "несколькими вещами."
+        "👕 <b>Clothing Extractor</b>\n\n"
+        "Пришли фотографию человека в одежде.\n\n"
+        "Я попробую выделить одежду и сделать "
+        "каталожную раскладку:\n\n"
+        "👕 верх\n"
+        "👖 штаны\n"
+        "👟 обувь\n\n"
+        "Финальное изображение будет на белом фоне."
     )
 
 
 # ============================================================
-# PHOTO
+# ФОТО
 # ============================================================
 
-@dp.message(F.photo)
-async def photo_handler(message: Message):
-    if not message.photo:
-        return
+@dp.message(
+    F.photo
+)
+async def photo_handler(
+    message: Message
+):
 
     status = await message.answer(
-        "⏳ Обрабатываю фото...\n"
-        "Убираю фон и раскладываю вещи."
+        "⏳ Получил фотографию...\n\n"
+        "👕 Выделяю одежду\n"
+        "👖 Отделяю штаны\n"
+        "👟 Ищу обувь\n"
+        "🧼 Делаю белый фон..."
     )
 
     try:
+
         photo = message.photo[-1]
 
         telegram_file = await bot.get_file(
             photo.file_id
         )
 
-        source = BytesIO()
+        buffer = BytesIO()
 
         await bot.download_file(
             telegram_file.file_path,
-            destination=source
+            destination=buffer
         )
 
-        image_bytes = source.getvalue()
+        data = buffer.getvalue()
 
-        if not image_bytes:
-            raise RuntimeError("Пустой файл изображения")
+        if not data:
 
-        image = decode_image(image_bytes)
+            raise RuntimeError(
+                "Фотография пустая"
+            )
 
+        image = decode_image(
+            data
+        )
+
+        # Обработка OpenCV выполняется
+        # в отдельном потоке.
         result = await asyncio.to_thread(
-            make_catalog_image,
+            create_catalog,
             image
         )
 
         await message.answer_photo(
             photo=types.BufferedInputFile(
                 result,
-                filename="clothing_catalog.jpg"
+                filename="clothing.jpg"
             ),
             caption=(
                 "✅ Готово!\n\n"
-                "👕 Вещи размещены на белом фоне.\n"
-                "Без генерации изображения и без AI-модели."
+                "👕 Одежда выделена и размещена "
+                "на белом фоне."
             )
         )
 
@@ -741,27 +1000,31 @@ async def photo_handler(message: Message):
             pass
 
     except Exception as e:
+
         log.exception(
-            "Ошибка обработки фото: %s",
+            "Ошибка: %s",
             e
         )
 
         await message.answer(
-            "❌ Не удалось обработать фото.\n\n"
-            "Попробуй отправить более чёткое фото, "
-            "желательно с хорошо отделённой от фона одеждой."
+            "❌ Не получилось выделить одежду.\n\n"
+            "Попробуй фотографию, где человека "
+            "хорошо видно целиком, а фон не слишком "
+            "сложный."
         )
 
 
 # ============================================================
-# OTHER
+# ДРУГИЕ СООБЩЕНИЯ
 # ============================================================
 
 @dp.message()
-async def other_message(message: Message):
+async def other_message(
+    message: Message
+):
+
     await message.answer(
-        "📸 Отправь мне фото одежды.\n\n"
-        "Я размещу вещи на чистом белом фоне."
+        "📸 Пришли фотографию человека в одежде."
     )
 
 
@@ -770,16 +1033,35 @@ async def other_message(message: Message):
 # ============================================================
 
 async def main():
-    log.info("👕 Clothing Layout Bot starting...")
-    log.info("AI image generation: OFF")
+
+    log.info(
+        "👕 Clothing Extractor starting..."
+    )
+
+    log.info(
+        "AI generation: OFF"
+    )
+
     await dp.start_polling(
         bot,
         allowed_updates=dp.resolve_used_update_types()
     )
 
 
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
 if __name__ == "__main__":
+
     try:
-        asyncio.run(main())
+
+        asyncio.run(
+            main()
+        )
+
     except KeyboardInterrupt:
-        log.info("Bot stopped")
+
+        log.info(
+            "Bot stopped"
+        )
