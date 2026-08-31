@@ -1,2 +1,3 @@
-openai
-aiogram
+aiogram>=3.0.0
+pyTelegramBotAPI
+requests
