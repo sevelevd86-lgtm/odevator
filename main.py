@@ -1,12 +1,18 @@
 import asyncio
 import os
+import time
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Optional
 
+import aiohttp
 import ccxt.async_support as ccxt
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+
 from dotenv import load_dotenv
 
 
@@ -16,17 +22,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-SECOND_EXCHANGE_NAME = os.getenv(
-    "SECOND_EXCHANGE",
-    "mexc"
-).lower()
+BOT_TOKEN = os.getenv(
+    "BOT_TOKEN",
+    ""
+).strip()
+
 
 SYMBOL = os.getenv(
     "SYMBOL",
     "BTC/USDT"
+).strip()
+
+
+TRADE_SIZE_USDT = float(
+    os.getenv(
+        "TRADE_SIZE_USDT",
+        "50"
+    )
 )
+
 
 MIN_NET_PROFIT = float(
     os.getenv(
@@ -35,354 +50,1141 @@ MIN_NET_PROFIT = float(
     )
 )
 
-TRADE_SIZE = float(
-    os.getenv(
-        "TRADE_SIZE_USDT",
-        "50"
-    )
-)
 
-SCAN_INTERVAL = int(
+SCAN_INTERVAL = float(
     os.getenv(
         "SCAN_INTERVAL_SECONDS",
         "5"
     )
 )
 
-PAPER_MODE = os.getenv(
-    "PAPER_MODE",
-    "true"
-).lower() == "true"
+
+ORDERBOOK_LEVELS = int(
+    os.getenv(
+        "ORDERBOOK_LEVELS",
+        "20"
+    )
+)
+
+
+TRANSFER_COST_USDT = float(
+    os.getenv(
+        "TRANSFER_COST_USDT",
+        "1.00"
+    )
+)
+
+
+# Приблизительные комиссии для предварительного расчёта.
+# Перед реальной торговлей обязательно заменить
+# на фактические комиссии аккаунтов.
+FEES = {
+
+    "coinex": float(
+        os.getenv(
+            "FEE_COINEX_PERCENT",
+            "0.10"
+        )
+    ),
+
+    "toobit": float(
+        os.getenv(
+            "FEE_TOOBIT_PERCENT",
+            "0.10"
+        )
+    ),
+
+    "weex": float(
+        os.getenv(
+            "FEE_WEEX_PERCENT",
+            "0.10"
+        )
+    ),
+
+    "1bit": float(
+        os.getenv(
+            "FEE_1BIT_PERCENT",
+            "0.10"
+        )
+    ),
+
+    "hyperliquid": float(
+        os.getenv(
+            "FEE_HYPERLIQUID_PERCENT",
+            "0.10"
+        )
+    ),
+}
 
 
 # ============================================================
-# BOT
+# SAFETY
 # ============================================================
+
+# Реальные ордера этой версией НЕ отправляются.
+LIVE_TRADING = False
+
 
 if not BOT_TOKEN:
+
     raise RuntimeError(
-        "BOT_TOKEN не найден. Заполни его в .env"
+        "BOT_TOKEN не найден.\n"
+        "Добавь токен в файл .env"
     )
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
 
 bot = Bot(
     token=BOT_TOKEN
 )
 
+
 dp = Dispatcher()
 
 
 # ============================================================
-# EXCHANGES
+# GLOBAL STATE
 # ============================================================
 
-exchange_classes = {
-    "mexc": ccxt.mexc,
-    "okx": ccxt.okx,
-    "binance": ccxt.binance,
-    "gate": ccxt.gate,
-    "kucoin": ccxt.kucoin,
-}
+auto_tasks = {}
 
-if SECOND_EXCHANGE_NAME not in exchange_classes:
-    raise RuntimeError(
-        f"Неизвестная биржа: {SECOND_EXCHANGE_NAME}"
-    )
-
-
-bybit = ccxt.bybit({
-    "enableRateLimit": True,
-})
-
-second_exchange = exchange_classes[
-    SECOND_EXCHANGE_NAME
-]({
-    "enableRateLimit": True,
-})
-
-
-# ============================================================
-# STATE
-# ============================================================
-
-auto_scan_running = False
-auto_scan_task = None
-
-paper_balance = 1000.0
-paper_profit = 0.0
-paper_trades = 0
 
 last_scan = None
-last_opportunity = None
+
+
+last_opportunities = []
+
+
+paper_balance = 1000.0
+
+
+paper_profit = 0.0
+
+
+paper_trades = 0
+
+
+session: Optional[
+    aiohttp.ClientSession
+] = None
+
+
+# Hyperliquid используется через CCXT
+ccxt_venues = {}
 
 
 # ============================================================
-# KEYBOARD
+# ORDER BOOK CLASS
 # ============================================================
 
-def main_keyboard():
+@dataclass
+class Book:
 
-    keyboard = InlineKeyboardBuilder()
+    venue: str
 
-    keyboard.button(
-        text="🔎 Сканировать",
-        callback_data="scan"
-    )
+    symbol: str
 
-    keyboard.button(
-        text="📊 Статус",
-        callback_data="status"
-    )
+    bids: list
 
-    keyboard.button(
-        text="▶️ Автоскан",
-        callback_data="autostart"
-    )
+    asks: list
 
-    keyboard.button(
-        text="⏹ Остановить",
-        callback_data="autostop"
-    )
+    timestamp: float
 
-    keyboard.button(
-        text="💰 PAPER баланс",
-        callback_data="balance"
-    )
 
-    keyboard.button(
-        text="📈 Статистика",
-        callback_data="stats"
-    )
+    @property
+    def best_bid(self):
 
-    keyboard.button(
-        text="⚙️ Настройки",
-        callback_data="settings"
-    )
+        if not self.bids:
 
-    keyboard.adjust(
-        2,
-        2,
-        2,
-        1
-    )
+            return 0.0
 
-    return keyboard.as_markup()
+        return self.bids[0][0]
+
+
+    @property
+    def best_ask(self):
+
+        if not self.asks:
+
+            return 0.0
+
+        return self.asks[0][0]
 
 
 # ============================================================
-# PRICE
+# HTTP
 # ============================================================
 
-async def get_ticker(exchange, symbol):
-
-    ticker = await exchange.fetch_ticker(
-        symbol
-    )
-
-    bid = ticker.get("bid")
-    ask = ticker.get("ask")
-    last = ticker.get("last")
-
-    return {
-        "bid": float(bid or 0),
-        "ask": float(ask or 0),
-        "last": float(last or 0)
-    }
-
-
-# ============================================================
-# ARBITRAGE CALCULATION
-# ============================================================
-
-def calculate(
-    buy_price,
-    sell_price,
-    buy_fee=0.001,
-    sell_fee=0.001
+async def http_json(
+    url,
+    params=None
 ):
 
-    if buy_price <= 0:
-        return None
+    async with session.get(
 
-    if sell_price <= 0:
-        return None
+        url,
 
-    gross = (
-        (sell_price - buy_price)
-        / buy_price
-    ) * 100
+        params=params,
 
-    fee_percent = (
-        buy_fee + sell_fee
-    ) * 100
+        timeout=aiohttp.ClientTimeout(
+            total=8
+        )
 
-    net = (
-        gross
-        - fee_percent
+    ) as response:
+
+        response.raise_for_status()
+
+        return await response.json()
+
+
+# ============================================================
+# NORMALIZE ORDERBOOK
+# ============================================================
+
+def normalize_levels(
+    rows
+):
+
+    result = []
+
+
+    for row in rows or []:
+
+        try:
+
+            price = float(
+                row[0]
+            )
+
+
+            amount = float(
+                row[1]
+            )
+
+
+            if price > 0 and amount > 0:
+
+                result.append(
+                    [
+                        price,
+                        amount
+                    ]
+                )
+
+        except Exception:
+
+            continue
+
+
+    return result
+
+
+# ============================================================
+# COINEX
+# ============================================================
+
+async def coinex_book():
+
+    data = await http_json(
+
+        "https://api.coinex.com/v2/spot/depth",
+
+        {
+            "market": "BTCUSDT",
+
+            "limit": ORDERBOOK_LEVELS,
+
+            "interval": "0"
+        }
     )
 
+
+    depth = data["data"]["depth"]
+
+
+    return Book(
+
+        venue="coinex",
+
+        symbol=SYMBOL,
+
+        bids=normalize_levels(
+            depth.get(
+                "bids"
+            )
+        ),
+
+        asks=normalize_levels(
+            depth.get(
+                "asks"
+            )
+        ),
+
+        timestamp=time.time()
+    )
+
+
+# ============================================================
+# TOOBIT
+# ============================================================
+
+async def toobit_book():
+
+    data = await http_json(
+
+        "https://api.toobit.com/api/v1/depth",
+
+        {
+            "symbol": "BTCUSDT",
+
+            "limit": ORDERBOOK_LEVELS
+        }
+    )
+
+
+    return Book(
+
+        venue="toobit",
+
+        symbol=SYMBOL,
+
+        bids=normalize_levels(
+            data.get(
+                "bids"
+            )
+        ),
+
+        asks=normalize_levels(
+            data.get(
+                "asks"
+            )
+        ),
+
+        timestamp=time.time()
+    )
+
+
+# ============================================================
+# WEEX
+# ============================================================
+
+async def weex_book():
+
+    data = await http_json(
+
+        "https://api-spot.weex.com/api/v3/market/depth",
+
+        {
+            "symbol": "BTCUSDT",
+
+            "limit": ORDERBOOK_LEVELS
+        }
+    )
+
+
+    return Book(
+
+        venue="weex",
+
+        symbol=SYMBOL,
+
+        bids=normalize_levels(
+            data.get(
+                "bids"
+            )
+        ),
+
+        asks=normalize_levels(
+            data.get(
+                "asks"
+            )
+        ),
+
+        timestamp=time.time()
+    )
+
+
+# ============================================================
+# 1BIT
+# ============================================================
+
+async def onebit_book():
+
+    data = await http_json(
+
+        "https://1bit.trade/api/v2/public/markets/btcusdt/depth",
+
+        {
+            "limit": ORDERBOOK_LEVELS
+        }
+    )
+
+
+    depth = data.get(
+        "data",
+        data
+    )
+
+
+    return Book(
+
+        venue="1bit",
+
+        symbol=SYMBOL,
+
+        bids=normalize_levels(
+            depth.get(
+                "bids"
+            )
+        ),
+
+        asks=normalize_levels(
+            depth.get(
+                "asks"
+            )
+        ),
+
+        timestamp=time.time()
+    )
+
+
+# ============================================================
+# HYPERLIQUID
+# ============================================================
+
+async def init_hyperliquid():
+
+    exchange = ccxt.hyperliquid({
+
+        "enableRateLimit": True,
+
+        "timeout": 10000
+    })
+
+
+    await exchange.load_markets()
+
+
+    ccxt_venues[
+        "hyperliquid"
+    ] = exchange
+
+
+async def hyperliquid_book():
+
+    exchange = ccxt_venues[
+        "hyperliquid"
+    ]
+
+
+    orderbook = await exchange.fetch_order_book(
+
+        SYMBOL,
+
+        ORDERBOOK_LEVELS
+    )
+
+
+    return Book(
+
+        venue="hyperliquid",
+
+        symbol=SYMBOL,
+
+        bids=normalize_levels(
+            orderbook.get(
+                "bids"
+            )
+        ),
+
+        asks=normalize_levels(
+            orderbook.get(
+                "asks"
+            )
+        ),
+
+        timestamp=time.time()
+    )
+
+
+# ============================================================
+# VENUE FUNCTIONS
+# ============================================================
+
+VENUE_FUNCTIONS = {
+
+    "coinex":
+        coinex_book,
+
+    "toobit":
+        toobit_book,
+
+    "weex":
+        weex_book,
+
+    "1bit":
+        onebit_book,
+
+    "hyperliquid":
+        hyperliquid_book,
+}
+
+
+# ============================================================
+# GET ALL ORDERBOOKS
+# ============================================================
+
+async def fetch_all_books():
+
+    results = await asyncio.gather(
+
+        *(
+            function()
+
+            for function
+            in VENUE_FUNCTIONS.values()
+        ),
+
+        return_exceptions=True
+    )
+
+
+    books = {}
+
+
+    for venue, result in zip(
+
+        VENUE_FUNCTIONS,
+
+        results
+    ):
+
+        if isinstance(
+            result,
+            Book
+        ):
+
+            if (
+
+                result.best_bid > 0
+
+                and
+
+                result.best_ask > 0
+
+            ):
+
+                books[
+                    venue
+                ] = result
+
+        else:
+
+            print(
+                f"[BOOK ERROR] "
+                f"{venue}: "
+                f"{result}"
+            )
+
+
+    return books
+
+
+# ============================================================
+# SIMULATE BUY FROM ASK SIDE
+# ============================================================
+
+def simulate_buy(
+
+    asks,
+
+    usdt_amount
+
+):
+
+    remaining_usdt = (
+        usdt_amount
+    )
+
+
+    btc_amount = 0.0
+
+
+    spent = 0.0
+
+
+    for price, amount in asks:
+
+        if remaining_usdt <= 0:
+
+            break
+
+
+        level_cost = (
+            price * amount
+        )
+
+
+        take_cost = min(
+
+            remaining_usdt,
+
+            level_cost
+        )
+
+
+        take_amount = (
+            take_cost / price
+        )
+
+
+        btc_amount += (
+            take_amount
+        )
+
+
+        spent += (
+            take_cost
+        )
+
+
+        remaining_usdt -= (
+            take_cost
+        )
+
+
+    if (
+
+        btc_amount <= 0
+
+        or
+
+        spent <= 0
+
+    ):
+
+        return None
+
+
+    average_price = (
+        spent / btc_amount
+    )
+
+
+    slippage = (
+
+        (
+            average_price
+            /
+            asks[0][0]
+        )
+
+        - 1
+
+    ) * 100
+
+
     return {
-        "buy_price": buy_price,
-        "sell_price": sell_price,
-        "gross": gross,
-        "fees": fee_percent,
-        "net": net
+
+        "base":
+            btc_amount,
+
+        "quote":
+            spent,
+
+        "avg":
+            average_price,
+
+        "slippage":
+            slippage,
+
+        "filled":
+            remaining_usdt <= 0.00000001
     }
 
 
 # ============================================================
-# SCANNER
+# SIMULATE SELL INTO BID SIDE
 # ============================================================
 
-async def scan_market():
+def simulate_sell(
 
-    global last_scan
-    global last_opportunity
+    bids,
 
-    bybit_data, second_data = await asyncio.gather(
+    btc_amount
 
-        get_ticker(
-            bybit,
-            SYMBOL
-        ),
+):
 
-        get_ticker(
-            second_exchange,
-            SYMBOL
-        )
+    remaining_btc = (
+        btc_amount
     )
+
+
+    received_usdt = 0.0
+
+
+    sold_btc = 0.0
+
+
+    for price, amount in bids:
+
+        if remaining_btc <= 0:
+
+            break
+
+
+        take_amount = min(
+
+            remaining_btc,
+
+            amount
+        )
+
+
+        sold_btc += (
+            take_amount
+        )
+
+
+        received_usdt += (
+
+            take_amount
+            *
+            price
+        )
+
+
+        remaining_btc -= (
+            take_amount
+        )
+
+
+    if (
+
+        sold_btc <= 0
+
+        or
+
+        received_usdt <= 0
+
+    ):
+
+        return None
+
+
+    average_price = (
+
+        received_usdt
+        /
+        sold_btc
+    )
+
+
+    slippage = (
+
+        (
+            bids[0][0]
+            -
+            average_price
+        )
+        /
+        bids[0][0]
+
+    ) * 100
+
+
+    return {
+
+        "base":
+            sold_btc,
+
+        "quote":
+            received_usdt,
+
+        "avg":
+            average_price,
+
+        "slippage":
+            slippage,
+
+        "filled":
+            remaining_btc <= 0.00000001
+    }
+
+
+# ============================================================
+# EVALUATE ARBITRAGE
+# ============================================================
+
+def evaluate_pair(
+
+    buy_book,
+
+    sell_book
+
+):
+
+    buy = simulate_buy(
+
+        buy_book.asks,
+
+        TRADE_SIZE_USDT
+    )
+
+
+    if not buy:
+
+        return None
+
+
+    if not buy["filled"]:
+
+        return None
+
+
+    sell = simulate_sell(
+
+        sell_book.bids,
+
+        buy["base"]
+    )
+
+
+    if not sell:
+
+        return None
+
+
+    if not sell["filled"]:
+
+        return None
+
+
+    buy_fee = (
+
+        FEES[
+            buy_book.venue
+        ]
+        /
+        100
+    )
+
+
+    sell_fee = (
+
+        FEES[
+            sell_book.venue
+        ]
+        /
+        100
+    )
+
+
+    gross_profit = (
+
+        sell["quote"]
+        -
+        buy["quote"]
+    )
+
+
+    trading_fees = (
+
+        buy["quote"]
+        *
+        buy_fee
+
+        +
+
+        sell["quote"]
+        *
+        sell_fee
+    )
+
+
+    net_profit = (
+
+        gross_profit
+
+        -
+
+        trading_fees
+
+        -
+
+        TRANSFER_COST_USDT
+    )
+
+
+    net_percent = (
+
+        net_profit
+        /
+        buy["quote"]
+
+    ) * 100
+
+
+    return {
+
+        "buy_venue":
+            buy_book.venue,
+
+        "sell_venue":
+            sell_book.venue,
+
+        "buy_avg":
+            buy["avg"],
+
+        "sell_avg":
+            sell["avg"],
+
+        "buy_best":
+            buy_book.best_ask,
+
+        "sell_best":
+            sell_book.best_bid,
+
+        "gross":
+            gross_profit,
+
+        "fees":
+            trading_fees,
+
+        "transfer":
+            TRANSFER_COST_USDT,
+
+        "net_profit":
+            net_profit,
+
+        "net_percent":
+            net_percent,
+
+        "buy_slippage":
+            buy["slippage"],
+
+        "sell_slippage":
+            sell["slippage"],
+
+        "total_slippage":
+            (
+                buy["slippage"]
+                +
+                sell["slippage"]
+            ),
+
+        "base_amount":
+            buy["base"]
+    }
+
+
+# ============================================================
+# FIND ALL OPPORTUNITIES
+# ============================================================
+
+def find_opportunities(
+    books
+):
 
     opportunities = []
 
-    # --------------------------------------------------------
-    # BYBIT -> SECOND
-    # --------------------------------------------------------
 
-    result = calculate(
-        buy_price=bybit_data["ask"],
-        sell_price=second_data["bid"]
+    venues = list(
+        books.values()
     )
 
-    if result:
 
-        result["buy_exchange"] = "Bybit"
+    for buy_book in venues:
 
-        result["sell_exchange"] = (
-            SECOND_EXCHANGE_NAME.upper()
-        )
+        for sell_book in venues:
 
-        opportunities.append(
-            result
-        )
+            if (
 
-    # --------------------------------------------------------
-    # SECOND -> BYBIT
-    # --------------------------------------------------------
+                buy_book.venue
+                ==
+                sell_book.venue
 
-    result = calculate(
-        buy_price=second_data["ask"],
-        sell_price=bybit_data["bid"]
-    )
+            ):
 
-    if result:
+                continue
 
-        result["buy_exchange"] = (
-            SECOND_EXCHANGE_NAME.upper()
-        )
 
-        result["sell_exchange"] = "Bybit"
+            result = evaluate_pair(
 
-        opportunities.append(
-            result
-        )
+                buy_book,
 
-    opportunities.sort(
-        key=lambda x: x["net"],
+                sell_book
+            )
+
+
+            if result:
+
+                opportunities.append(
+                    result
+                )
+
+
+    return sorted(
+
+        opportunities,
+
+        key=lambda x:
+            x["net_percent"],
+
         reverse=True
     )
 
-    last_scan = datetime.now()
 
-    if opportunities:
+# ============================================================
+# TELEGRAM KEYBOARD
+# ============================================================
 
-        last_opportunity = opportunities[0]
+def keyboard():
 
-    else:
+    kb = InlineKeyboardBuilder()
 
-        last_opportunity = None
 
-    return opportunities
+    kb.button(
+
+        text="🔎 Сканировать",
+
+        callback_data="scan"
+    )
+
+
+    kb.button(
+
+        text="📚 Стаканы",
+
+        callback_data="books"
+    )
+
+
+    kb.button(
+
+        text="🔥 Возможности",
+
+        callback_data="opps"
+    )
+
+
+    kb.button(
+
+        text="▶️ Автоскан",
+
+        callback_data="auto_start"
+    )
+
+
+    kb.button(
+
+        text="⏹ Стоп",
+
+        callback_data="auto_stop"
+    )
+
+
+    kb.button(
+
+        text="💰 PAPER",
+
+        callback_data="paper"
+    )
+
+
+    kb.button(
+
+        text="📈 Статистика",
+
+        callback_data="stats"
+    )
+
+
+    kb.button(
+
+        text="⚙️ Настройки",
+
+        callback_data="settings"
+    )
+
+
+    kb.adjust(
+        2,
+        2,
+        2,
+        2
+    )
+
+
+    return kb.as_markup()
 
 
 # ============================================================
 # FORMAT OPPORTUNITY
 # ============================================================
 
-def format_opportunity(op):
-
-    buy_exchange = op[
-        "buy_exchange"
-    ]
-
-    sell_exchange = op[
-        "sell_exchange"
-    ]
-
-    buy_price = op[
-        "buy_price"
-    ]
-
-    sell_price = op[
-        "sell_price"
-    ]
-
-    gross = op[
-        "gross"
-    ]
-
-    fees = op[
-        "fees"
-    ]
-
-    net = op[
-        "net"
-    ]
-
-    estimated_profit = (
-        TRADE_SIZE
-        * net
-        / 100
-    )
+def format_opportunity(
+    op
+):
 
     return (
+
         "🔥 <b>АРБИТРАЖ НАЙДЕН</b>\n\n"
 
-        f"💱 Пара: <b>{SYMBOL}</b>\n\n"
+        f"💱 <b>{SYMBOL}</b>\n\n"
 
-        f"🟢 Купить:\n"
-        f"<b>{buy_exchange}</b>\n"
-        f"${buy_price:,.2f}\n\n"
+        f"🟢 BUY → "
+        f"<b>{op['buy_venue'].upper()}</b>\n"
 
-        f"🔴 Продать:\n"
-        f"<b>{sell_exchange}</b>\n"
-        f"${sell_price:,.2f}\n\n"
+        f"Средняя цена: "
+        f"${op['buy_avg']:,.2f}\n"
 
-        "━━━━━━━━━━━━━━\n\n"
+        f"Best Ask: "
+        f"${op['buy_best']:,.2f}\n\n"
 
-        f"📈 Gross: <b>{gross:.3f}%</b>\n"
-        f"💸 Комиссии: <b>-{fees:.3f}%</b>\n"
-        f"💰 NET: <b>{net:.3f}%</b>\n\n"
+        f"🔴 SELL → "
+        f"<b>{op['sell_venue'].upper()}</b>\n"
 
-        f"💵 Размер сделки: ${TRADE_SIZE:.2f}\n"
-        f"📊 Расчётная прибыль: "
-        f"<b>${estimated_profit:.4f}</b>\n\n"
+        f"Средняя цена: "
+        f"${op['sell_avg']:,.2f}\n"
 
-        f"🧪 Режим: "
-        f"<b>{'PAPER' if PAPER_MODE else 'LIVE'}</b>"
+        f"Best Bid: "
+        f"${op['sell_best']:,.2f}\n\n"
+
+        "━━━━━━━━━━━━━━━━\n\n"
+
+        f"📈 Gross: "
+        f"${op['gross']:.4f}\n"
+
+        f"💸 Trading fees: "
+        f"-${op['fees']:.4f}\n"
+
+        f"🌐 Transfer reserve: "
+        f"-${op['transfer']:.2f}\n"
+
+        f"📉 Slippage: "
+        f"{op['total_slippage']:.4f}%\n\n"
+
+        f"💰 NET: "
+        f"<b>${op['net_profit']:.4f}</b>\n"
+
+        f"📊 NET %: "
+        f"<b>{op['net_percent']:.3f}%</b>\n\n"
+
+        f"📦 BTC: "
+        f"{op['base_amount']:.8f}\n\n"
+
+        "🧪 <b>PAPER MODE</b>\n"
+
+        "Реальные ордера не отправляются."
     )
 
 
 # ============================================================
-# START COMMAND
+# /START
 # ============================================================
 
 @dp.message(
@@ -394,248 +1196,448 @@ async def start_command(
 
     await message.answer(
 
-        "🐻‍❄️ <b>CRYPTO ARBITRAGE</b>\n\n"
+        "🐻‍❄️ <b>CRYPTO ARBITRAGE ENGINE</b>\n\n"
 
-        "Добро пожаловать!\n\n"
+        "Я сравниваю 5 площадок:\n\n"
 
-        "Я сравниваю цены между "
-        "Bybit и второй биржей и "
-        "ищу потенциальный арбитраж.\n\n"
+        "• CoinEx\n"
+        "• Toobit\n"
+        "• WEEX\n"
+        "• 1bit\n"
+        "• Hyperliquid\n\n"
 
         f"💱 Пара: <b>{SYMBOL}</b>\n"
-        f"🧪 Режим: "
-        f"<b>{'PAPER' if PAPER_MODE else 'LIVE'}</b>\n\n"
 
-        "Выбери действие ниже 👇",
+        f"📦 Размер: "
+        f"<b>${TRADE_SIZE_USDT:.2f}</b>\n\n"
 
-        reply_markup=main_keyboard(),
+        "Бот получает стаканы и считает "
+        "среднюю цену исполнения, "
+        "комиссии, проскальзывание и "
+        "резерв на transfer/network costs.\n\n"
+
+        "🧪 Сейчас включён PAPER MODE.",
+
+        reply_markup=keyboard(),
 
         parse_mode="HTML"
     )
 
 
 # ============================================================
-# SCAN BUTTON
+# SCAN
 # ============================================================
 
 @dp.callback_query(
     F.data == "scan"
 )
 async def scan_button(
-    callback: CallbackQuery
+    call: CallbackQuery
 ):
 
-    await callback.answer(
+    global last_scan
+    global last_opportunities
+
+
+    await call.answer(
         "Сканирую..."
     )
 
+
     try:
 
-        opportunities = await scan_market()
+        books = await fetch_all_books()
+
+
+        opportunities = (
+            find_opportunities(
+                books
+            )
+        )
+
+
+        last_opportunities = (
+            opportunities
+        )
+
+
+        last_scan = (
+            datetime.now()
+        )
+
 
         if not opportunities:
 
             text = (
-                "❌ <b>Нет данных</b>\n\n"
-                "Не удалось получить котировки."
+
+                "❌ <b>НЕТ ДАННЫХ</b>\n\n"
+
+                "Не удалось получить "
+                "достаточно стаканов."
             )
 
         else:
 
             best = opportunities[0]
 
-            if best["net"] < MIN_NET_PROFIT:
+
+            if (
+
+                best["net_percent"]
+                <
+                MIN_NET_PROFIT
+
+            ):
 
                 text = (
 
-                    "🔎 <b>СКАНИРОВАНИЕ</b>\n\n"
+                    "🔎 <b>СКАН ЗАВЕРШЁН</b>\n\n"
 
-                    f"Лучший найденный вариант:\n\n"
+                    f"Стаканов: "
+                    f"<b>{len(books)}/5</b>\n\n"
 
-                    f"{best['buy_exchange']} → "
-                    f"{best['sell_exchange']}\n\n"
+                    f"Лучший NET: "
+                    f"<b>{best['net_percent']:.3f}%</b>\n\n"
 
-                    f"NET: "
-                    f"<b>{best['net']:.3f}%</b>\n\n"
+                    f"Порог: "
+                    f"<b>{MIN_NET_PROFIT:.3f}%</b>\n\n"
 
-                    f"Минимальный порог: "
-                    f"{MIN_NET_PROFIT:.2f}%\n\n"
-
-                    "❌ Сделка ниже установленного "
-                    "порога."
+                    "❌ Возможность ниже "
+                    "установленного порога."
                 )
 
             else:
 
-                text = format_opportunity(
-                    best
+                text = (
+                    format_opportunity(
+                        best
+                    )
                 )
 
-        await callback.message.edit_text(
+
+        await call.message.edit_text(
 
             text,
 
-            reply_markup=main_keyboard(),
-
-            parse_mode="HTML"
-        )
-
-    except Exception as error:
-
-        await callback.message.edit_text(
-
-            "⚠️ <b>Ошибка сканирования</b>\n\n"
-
-            f"<code>{error}</code>",
-
-            reply_markup=main_keyboard(),
+            reply_markup=keyboard(),
 
             parse_mode="HTML"
         )
 
 
-# ============================================================
-# STATUS
-# ============================================================
+    except Exception as e:
 
-@dp.callback_query(
-    F.data == "status"
-)
-async def status_button(
-    callback: CallbackQuery
-):
+        await call.message.edit_text(
 
-    await callback.answer()
+            "⚠️ <b>ОШИБКА</b>\n\n"
 
-    status = (
-        "🟢 Работает"
-        if auto_scan_running
-        else
-        "🔴 Остановлен"
-    )
+            f"<code>{e}</code>",
 
-    last_scan_text = (
+            reply_markup=keyboard(),
 
-        last_scan.strftime(
-            "%H:%M:%S"
+            parse_mode="HTML"
         )
 
-        if last_scan
-
-        else
-
-        "ещё не запускался"
-    )
-
-    await callback.message.edit_text(
-
-        "📊 <b>СТАТУС БОТА</b>\n\n"
-
-        f"🤖 Bot: <b>ONLINE</b>\n"
-
-        f"🔎 Автоскан: <b>{status}</b>\n"
-
-        f"💱 Пара: <b>{SYMBOL}</b>\n"
-
-        f"🏦 Bybit\n"
-
-        f"🏦 {SECOND_EXCHANGE_NAME.upper()}\n\n"
-
-        f"🧪 PAPER MODE: "
-        f"<b>{PAPER_MODE}</b>\n"
-
-        f"⏱ Интервал: "
-        f"<b>{SCAN_INTERVAL} сек.</b>\n"
-
-        f"🎯 Минимальный NET: "
-        f"<b>{MIN_NET_PROFIT:.2f}%</b>\n\n"
-
-        f"🕐 Последний скан: "
-        f"<b>{last_scan_text}</b>",
-
-        reply_markup=main_keyboard(),
-
-        parse_mode="HTML"
-    )
-
 
 # ============================================================
-# PAPER BALANCE
+# BOOKS
 # ============================================================
 
 @dp.callback_query(
-    F.data == "balance"
+    F.data == "books"
 )
-async def balance_button(
-    callback: CallbackQuery
+async def books_button(
+    call: CallbackQuery
 ):
 
-    await callback.answer()
+    await call.answer(
+        "Получаю стаканы..."
+    )
 
-    await callback.message.edit_text(
 
-        "💰 <b>PAPER БАЛАНС</b>\n\n"
+    try:
 
-        f"Начальный баланс:\n"
-        f"$1,000.00\n\n"
+        books = (
+            await fetch_all_books()
+        )
 
-        f"Текущий баланс:\n"
+
+        lines = [
+
+            "📚 <b>СТАКАНЫ</b>\n",
+
+            f"💱 {SYMBOL}\n"
+        ]
+
+
+        for venue in VENUE_FUNCTIONS:
+
+            book = books.get(
+                venue
+            )
+
+
+            if not book:
+
+                lines.append(
+
+                    f"🔴 <b>{venue.upper()}</b>"
+                    " — нет данных\n"
+                )
+
+                continue
+
+
+            spread = (
+
+                (
+                    book.best_ask
+                    /
+                    book.best_bid
+                )
+
+                - 1
+
+            ) * 100
+
+
+            lines.append(
+
+                f"🟢 <b>{venue.upper()}</b>\n"
+
+                f"ASK: "
+                f"${book.best_ask:,.2f}\n"
+
+                f"BID: "
+                f"${book.best_bid:,.2f}\n"
+
+                f"Spread: "
+                f"{spread:.4f}%\n"
+            )
+
+
+        await call.message.edit_text(
+
+            "\n".join(lines),
+
+            reply_markup=keyboard(),
+
+            parse_mode="HTML"
+        )
+
+
+    except Exception as e:
+
+        await call.message.edit_text(
+
+            f"⚠️ Ошибка:\n"
+            f"<code>{e}</code>",
+
+            reply_markup=keyboard(),
+
+            parse_mode="HTML"
+        )
+
+
+# ============================================================
+# OPPORTUNITIES
+# ============================================================
+
+@dp.callback_query(
+    F.data == "opps"
+)
+async def opportunities_button(
+    call: CallbackQuery
+):
+
+    await call.answer(
+        "Считаю..."
+    )
+
+
+    try:
+
+        books = (
+            await fetch_all_books()
+        )
+
+
+        opportunities = (
+            find_opportunities(
+                books
+            )
+        )
+
+
+        good = [
+
+            x
+
+            for x
+            in opportunities
+
+            if (
+
+                x["net_percent"]
+                >=
+                MIN_NET_PROFIT
+
+            )
+
+        ][:10]
+
+
+        if not good:
+
+            text = (
+
+                "❌ <b>ВОЗМОЖНОСТЕЙ НЕТ</b>\n\n"
+
+                f"Порог: "
+                f"{MIN_NET_PROFIT:.3f}%"
+            )
+
+
+        else:
+
+            lines = [
+
+                "🔥 <b>ТОП АРБИТРАЖА</b>\n"
+            ]
+
+
+            for index, op in enumerate(
+
+                good,
+
+                1
+            ):
+
+                lines.append(
+
+                    f"{index}. "
+
+                    f"{op['buy_venue'].upper()}"
+
+                    " → "
+
+                    f"{op['sell_venue'].upper()}\n"
+
+                    f"NET: "
+                    f"<b>{op['net_percent']:.3f}%</b>\n"
+
+                    f"Profit: "
+                    f"<b>${op['net_profit']:.4f}</b>\n"
+                )
+
+
+            text = "\n".join(
+                lines
+            )
+
+
+        await call.message.edit_text(
+
+            text,
+
+            reply_markup=keyboard(),
+
+            parse_mode="HTML"
+        )
+
+
+    except Exception as e:
+
+        await call.message.edit_text(
+
+            f"⚠️ Ошибка:\n"
+            f"<code>{e}</code>",
+
+            reply_markup=keyboard(),
+
+            parse_mode="HTML"
+        )
+
+
+# ============================================================
+# PAPER
+# ============================================================
+
+@dp.callback_query(
+    F.data == "paper"
+)
+async def paper_button(
+    call: CallbackQuery
+):
+
+    await call.answer()
+
+
+    await call.message.edit_text(
+
+        "💰 <b>PAPER ACCOUNT</b>\n\n"
+
+        f"Начальный баланс: "
+        f"<b>$1,000.00</b>\n\n"
+
+        f"Текущий баланс: "
         f"<b>${paper_balance:.2f}</b>\n\n"
 
-        f"Прибыль:\n"
+        f"Прибыль: "
         f"<b>${paper_profit:.2f}</b>\n\n"
 
-        f"Сделок:\n"
+        f"Сделок: "
         f"<b>{paper_trades}</b>\n\n"
 
-        "🧪 Это виртуальный баланс.\n"
-        "Реальные средства не используются.",
+        "🧪 Виртуальный счёт.\n"
+        "Реальные деньги не используются.",
 
-        reply_markup=main_keyboard(),
+        reply_markup=keyboard(),
 
         parse_mode="HTML"
     )
 
 
 # ============================================================
-# STATISTICS
+# STATS
 # ============================================================
 
 @dp.callback_query(
     F.data == "stats"
 )
 async def stats_button(
-    callback: CallbackQuery
+    call: CallbackQuery
 ):
 
-    await callback.answer()
+    await call.answer()
+
 
     roi = (
-        paper_profit
-        / 1000
-        * 100
-    )
 
-    await callback.message.edit_text(
+        paper_profit
+        /
+        1000
+
+    ) * 100
+
+
+    await call.message.edit_text(
 
         "📈 <b>СТАТИСТИКА</b>\n\n"
 
-        f"💰 PAPER баланс: "
-        f"<b>${paper_balance:.2f}</b>\n\n"
+        f"💰 Баланс: "
+        f"${paper_balance:.2f}\n"
 
-        f"💵 Прибыль: "
-        f"<b>${paper_profit:.2f}</b>\n\n"
+        f"📈 Прибыль: "
+        f"${paper_profit:.2f}\n"
 
         f"📊 ROI: "
-        f"<b>{roi:.3f}%</b>\n\n"
+        f"{roi:.3f}%\n"
 
         f"🔄 Сделок: "
-        f"<b>{paper_trades}</b>\n\n"
+        f"{paper_trades}\n",
 
-        "⚠️ Пока реальные ордера "
-        "не отправляются.",
-
-        reply_markup=main_keyboard(),
+        reply_markup=keyboard(),
 
         parse_mode="HTML"
     )
@@ -649,60 +1651,82 @@ async def stats_button(
     F.data == "settings"
 )
 async def settings_button(
-    callback: CallbackQuery
+    call: CallbackQuery
 ):
 
-    await callback.answer()
+    await call.answer()
 
-    await callback.message.edit_text(
+
+    await call.message.edit_text(
 
         "⚙️ <b>НАСТРОЙКИ</b>\n\n"
 
-        f"💱 Пара:\n"
+        f"💱 Пара: "
         f"<b>{SYMBOL}</b>\n\n"
 
-        f"🎯 Минимальный NET:\n"
-        f"<b>{MIN_NET_PROFIT:.2f}%</b>\n\n"
+        f"💵 Размер: "
+        f"<b>${TRADE_SIZE_USDT:.2f}</b>\n\n"
 
-        f"💵 Размер сделки:\n"
-        f"<b>${TRADE_SIZE:.2f}</b>\n\n"
+        f"🎯 Минимальный NET: "
+        f"<b>{MIN_NET_PROFIT:.3f}%</b>\n\n"
 
-        f"⏱ Интервал:\n"
+        f"📚 Уровней стакана: "
+        f"<b>{ORDERBOOK_LEVELS}</b>\n\n"
+
+        f"🌐 Transfer reserve: "
+        f"<b>${TRANSFER_COST_USDT:.2f}</b>\n\n"
+
+        f"⏱ Интервал: "
         f"<b>{SCAN_INTERVAL} сек.</b>\n\n"
 
-        f"🏦 Вторая биржа:\n"
-        f"<b>{SECOND_EXCHANGE_NAME.upper()}</b>\n\n"
+        "🧪 LIVE TRADING: <b>OFF</b>\n\n"
 
-        "Изменение этих параметров "
-        "делается в файле <code>.env</code>.",
+        "Настройки изменяются через .env.",
 
-        reply_markup=main_keyboard(),
+        reply_markup=keyboard(),
 
         parse_mode="HTML"
     )
 
 
 # ============================================================
-# AUTO SCAN
+# AUTO SCANNER
 # ============================================================
 
-async def automatic_scanner(
+async def auto_loop(
     chat_id
 ):
 
-    global auto_scan_running
-
-    while auto_scan_running:
+    while True:
 
         try:
 
-            opportunities = await scan_market()
+            books = (
+                await fetch_all_books()
+            )
+
+
+            opportunities = (
+                find_opportunities(
+                    books
+                )
+            )
+
 
             if opportunities:
 
-                best = opportunities[0]
+                best = (
+                    opportunities[0]
+                )
 
-                if best["net"] >= MIN_NET_PROFIT:
+
+                if (
+
+                    best["net_percent"]
+                    >=
+                    MIN_NET_PROFIT
+
+                ):
 
                     await bot.send_message(
 
@@ -715,12 +1739,19 @@ async def automatic_scanner(
                         parse_mode="HTML"
                     )
 
-        except Exception as error:
+
+        except asyncio.CancelledError:
+
+            raise
+
+
+        except Exception as e:
 
             print(
-                "Scanner error:",
-                error
+                "[AUTO ERROR]",
+                e
             )
+
 
         await asyncio.sleep(
             SCAN_INTERVAL
@@ -728,107 +1759,127 @@ async def automatic_scanner(
 
 
 # ============================================================
-# START AUTO SCAN
+# AUTO START
 # ============================================================
 
 @dp.callback_query(
-    F.data == "autostart"
+    F.data == "auto_start"
 )
-async def autostart_button(
-    callback: CallbackQuery
+async def auto_start(
+    call: CallbackQuery
 ):
 
-    global auto_scan_running
-    global auto_scan_task
+    chat_id = (
+        call.message.chat.id
+    )
 
-    await callback.answer()
 
-    if auto_scan_running:
+    if chat_id in auto_tasks:
 
-        await callback.message.answer(
-            "ℹ️ Автоскан уже работает."
+        await call.answer(
+            "Уже запущено"
         )
 
         return
 
-    auto_scan_running = True
 
-    auto_scan_task = asyncio.create_task(
+    auto_tasks[
+        chat_id
+    ] = asyncio.create_task(
 
-        automatic_scanner(
-            callback.message.chat.id
+        auto_loop(
+            chat_id
         )
     )
 
-    await callback.message.edit_text(
+
+    await call.answer(
+        "Запущено"
+    )
+
+
+    await call.message.edit_text(
 
         "▶️ <b>АВТОСКАН ЗАПУЩЕН</b>\n\n"
 
-        f"Пара: {SYMBOL}\n"
+        "Площадки:\n"
 
-        f"Интервал: "
-        f"{SCAN_INTERVAL} сек.\n\n"
+        "CoinEx\n"
+        "Toobit\n"
+        "WEEX\n"
+        "1bit\n"
+        "Hyperliquid\n\n"
 
-        f"Бот будет присылать "
-        f"возможности от "
-        f"<b>{MIN_NET_PROFIT:.2f}% NET</b>.",
+        f"💱 {SYMBOL}\n"
 
-        reply_markup=main_keyboard(),
+        f"💵 ${TRADE_SIZE_USDT:.2f}\n"
+
+        f"🎯 {MIN_NET_PROFIT:.3f}%\n"
+
+        f"⏱ {SCAN_INTERVAL} сек.",
+
+        reply_markup=keyboard(),
 
         parse_mode="HTML"
     )
 
 
 # ============================================================
-# STOP AUTO SCAN
+# AUTO STOP
 # ============================================================
 
 @dp.callback_query(
-    F.data == "autostop"
+    F.data == "auto_stop"
 )
-async def autostop_button(
-    callback: CallbackQuery
+async def auto_stop(
+    call: CallbackQuery
 ):
 
-    global auto_scan_running
-    global auto_scan_task
+    chat_id = (
+        call.message.chat.id
+    )
 
-    await callback.answer()
 
-    auto_scan_running = False
+    task = auto_tasks.pop(
+        chat_id,
+        None
+    )
 
-    if auto_scan_task:
 
-        auto_scan_task.cancel()
+    if task:
 
-        auto_scan_task = None
+        task.cancel()
 
-    await callback.message.edit_text(
 
-        "⏹ <b>АВТОСКАН ОСТАНОВЛЕН</b>\n\n"
+    await call.answer(
+        "Остановлено"
+    )
 
-        "Бот больше не сканирует рынок.",
 
-        reply_markup=main_keyboard(),
+    await call.message.edit_text(
+
+        "⏹ <b>АВТОСКАН ОСТАНОВЛЕН</b>",
+
+        reply_markup=keyboard(),
 
         parse_mode="HTML"
     )
 
 
 # ============================================================
-# ERROR HANDLING / UNKNOWN COMMANDS
+# UNKNOWN MESSAGE
 # ============================================================
 
 @dp.message()
-async def any_message(
+async def fallback(
     message: Message
 ):
 
     await message.answer(
 
-        "🐻‍❄️ Используй меню ниже:",
+        "🐻‍❄️ Используй меню:",
 
-        reply_markup=main_keyboard()
+        reply_markup=keyboard()
     )
 
 
@@ -838,51 +1889,83 @@ async def any_message(
 
 async def main():
 
+    global session
+
+
     print(
-        "================================="
+        "========================================"
     )
 
     print(
-        "🐻‍❄️ CRYPTO ARBITRAGE BOT"
+        "🐻‍❄️ CRYPTO ARBITRAGE ENGINE"
     )
 
     print(
-        "================================="
+        "========================================"
     )
 
     print(
-        f"Symbol: {SYMBOL}"
+        "Mode: PAPER"
     )
 
     print(
-        f"Second exchange: "
-        f"{SECOND_EXCHANGE_NAME.upper()}"
+        "Live trading: OFF"
     )
 
     print(
-        f"Paper mode: {PAPER_MODE}"
+        "Starting..."
     )
 
-    print(
-        f"Min NET: "
-        f"{MIN_NET_PROFIT}%"
+
+    session = (
+        aiohttp.ClientSession()
     )
 
-    print(
-        "Bot started..."
-    )
 
     try:
+
+        await init_hyperliquid()
+
+
+        print(
+            "Hyperliquid loaded."
+        )
+
+
+        print(
+            "Starting Telegram..."
+        )
+
 
         await dp.start_polling(
             bot
         )
 
+
     finally:
 
-        await bybit.close()
+        for task in auto_tasks.values():
 
-        await second_exchange.close()
+            task.cancel()
+
+
+        for exchange in (
+            ccxt_venues.values()
+        ):
+
+            try:
+
+                await exchange.close()
+
+            except Exception:
+
+                pass
+
+
+        if session:
+
+            await session.close()
+
 
         await bot.session.close()
 
