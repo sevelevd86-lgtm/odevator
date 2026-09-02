@@ -101,14 +101,14 @@ RETURN_SCALER_FILE = os.getenv(
 MIN_MARKET_AGE_DAYS = int(
     os.getenv(
         "MIN_MARKET_AGE_DAYS",
-        "365"
+        "60"
     )
 )
 
 MIN_24H_VOLUME_USDT = float(
     os.getenv(
         "MIN_24H_VOLUME_USDT",
-        "1000000"
+        "1000"
     )
 )
 
