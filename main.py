@@ -38,7 +38,7 @@ START_BALANCE = float(
 )
 
 SCAN_INTERVAL = int(
-    os.getenv("SCAN_INTERVAL_SECONDS", "15")
+    os.getenv("SCAN_INTERVAL_SECONDS", "10")
 )
 
 MIN_TRADE_USDT = float(
