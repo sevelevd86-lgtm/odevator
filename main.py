@@ -194,6 +194,9 @@ bot: Optional[Bot] = None
 
 dp = Dispatcher()
 
+# ВАЖНО:
+# db НЕ используется до init_database()
+
 db = None
 
 exchanges = {}
@@ -212,12 +215,44 @@ auto_task = None
 
 
 # ============================================================
+# POSITION
+# ============================================================
+
+@dataclass
+class Position:
+
+    symbol: str
+
+    exchange: str
+
+    amount: float
+
+    entry_price: float
+
+    invested: float
+
+    opened_at: float
+
+    entry_score: float
+
+    ml_probability: float
+
+    features: dict
+
+
+# ============================================================
 # DATABASE
 # ============================================================
 
 def init_database():
 
     global db
+
+    # Если по какой-то причине БД уже существует
+    # — не создаём второе соединение.
+
+    if db is not None:
+        return
 
     db = sqlite3.connect(
         DATABASE_FILE,
@@ -326,6 +361,10 @@ def init_database():
 
     db.commit()
 
+    print(
+        f"[DATABASE] initialized: {DATABASE_FILE}"
+    )
+
 
 # ============================================================
 # WALLET DATABASE
@@ -333,16 +372,47 @@ def init_database():
 
 def load_wallet_state():
 
+    if db is None:
+        raise RuntimeError(
+            "Database is not initialized"
+        )
+
     row = db.execute("""
         SELECT *
         FROM wallet
         WHERE id = 1
     """).fetchone()
 
+    if row is None:
+
+        db.execute("""
+            INSERT INTO wallet (
+                id,
+                usdt,
+                realized_profit,
+                total_fees
+            )
+            VALUES (1, ?, 0, 0)
+        """, (
+            START_BALANCE,
+        ))
+
+        db.commit()
+
+        return {
+            "usdt": START_BALANCE,
+            "realized_profit": 0.0,
+            "total_fees": 0.0
+        }
+
     return {
-        "usdt": row["usdt"],
-        "realized_profit": row["realized_profit"],
-        "total_fees": row["total_fees"]
+        "usdt": float(row["usdt"]),
+        "realized_profit": float(
+            row["realized_profit"]
+        ),
+        "total_fees": float(
+            row["total_fees"]
+        )
     }
 
 
@@ -351,6 +421,11 @@ def save_wallet_state(
     realized_profit,
     total_fees
 ):
+
+    if db is None:
+        raise RuntimeError(
+            "Database is not initialized"
+        )
 
     db.execute("""
         UPDATE wallet
@@ -373,6 +448,11 @@ def save_wallet_state(
 # ============================================================
 
 def save_position(position):
+
+    if db is None:
+        raise RuntimeError(
+            "Database is not initialized"
+        )
 
     db.execute("""
         INSERT OR REPLACE INTO positions (
@@ -406,6 +486,11 @@ def save_position(position):
 
 def delete_position(symbol):
 
+    if db is None:
+        raise RuntimeError(
+            "Database is not initialized"
+        )
+
     db.execute("""
         DELETE FROM positions
         WHERE symbol = ?
@@ -418,32 +503,58 @@ def delete_position(symbol):
 
 def load_positions():
 
+    if db is None:
+        raise RuntimeError(
+            "Database is not initialized"
+        )
+
     rows = db.execute("""
         SELECT *
         FROM positions
     """).fetchall()
 
-    positions = {}
+    loaded_positions = {}
 
     for row in rows:
 
-        positions[
-            row["symbol"]
-        ] = Position(
-            symbol=row["symbol"],
-            exchange=row["exchange"],
-            amount=row["amount"],
-            entry_price=row["entry_price"],
-            invested=row["invested"],
-            opened_at=row["opened_at"],
-            entry_score=row["entry_score"],
-            ml_probability=row["ml_probability"],
-            features=json.loads(
-                row["features"]
-            )
-        )
+        try:
 
-    return positions
+            loaded_positions[
+                row["symbol"]
+            ] = Position(
+                symbol=row["symbol"],
+                exchange=row["exchange"],
+                amount=float(
+                    row["amount"]
+                ),
+                entry_price=float(
+                    row["entry_price"]
+                ),
+                invested=float(
+                    row["invested"]
+                ),
+                opened_at=float(
+                    row["opened_at"]
+                ),
+                entry_score=float(
+                    row["entry_score"]
+                ),
+                ml_probability=float(
+                    row["ml_probability"]
+                ),
+                features=json.loads(
+                    row["features"]
+                )
+            )
+
+        except Exception as e:
+
+            print(
+                "[DATABASE] position load error:",
+                e
+            )
+
+    return loaded_positions
 
 
 # ============================================================
@@ -452,11 +563,33 @@ def load_positions():
 
 def load_learning_state():
 
+    if db is None:
+        raise RuntimeError(
+            "Database is not initialized"
+        )
+
     row = db.execute("""
         SELECT *
         FROM learning_state
         WHERE id = 1
     """).fetchone()
+
+    if row is None:
+
+        db.execute("""
+            INSERT INTO learning_state (
+                id
+            )
+            VALUES (1)
+        """)
+
+        db.commit()
+
+        row = db.execute("""
+            SELECT *
+            FROM learning_state
+            WHERE id = 1
+        """).fetchone()
 
     return row
 
@@ -470,6 +603,11 @@ def save_learning_state(
     worst_trade,
     model_updates
 ):
+
+    if db is None:
+        raise RuntimeError(
+            "Database is not initialized"
+        )
 
     db.execute("""
         UPDATE learning_state
@@ -507,6 +645,11 @@ def save_trade(
     reason,
     exit_score
 ):
+
+    if db is None:
+        raise RuntimeError(
+            "Database is not initialized"
+        )
 
     db.execute("""
         INSERT INTO trades (
@@ -552,38 +695,15 @@ def save_trade(
 
 def get_trades():
 
+    if db is None:
+        return []
+
     return db.execute("""
         SELECT *
         FROM trades
         ORDER BY id DESC
         LIMIT 20
     """).fetchall()
-
-
-# ============================================================
-# POSITION
-# ============================================================
-
-@dataclass
-class Position:
-
-    symbol: str
-
-    exchange: str
-
-    amount: float
-
-    entry_price: float
-
-    invested: float
-
-    opened_at: float
-
-    entry_score: float
-
-    ml_probability: float
-
-    features: dict
 
 
 # ============================================================
@@ -596,19 +716,33 @@ class LearningEngine:
 
         state = load_learning_state()
 
-        self.total_trades = state["total_trades"]
+        self.total_trades = int(
+            state["total_trades"]
+        )
 
-        self.wins = state["wins"]
+        self.wins = int(
+            state["wins"]
+        )
 
-        self.losses = state["losses"]
+        self.losses = int(
+            state["losses"]
+        )
 
-        self.total_profit = state["total_profit"]
+        self.total_profit = float(
+            state["total_profit"]
+        )
 
-        self.best_trade = state["best_trade"]
+        self.best_trade = float(
+            state["best_trade"]
+        )
 
-        self.worst_trade = state["worst_trade"]
+        self.worst_trade = float(
+            state["worst_trade"]
+        )
 
-        self.model_updates = state["model_updates"]
+        self.model_updates = int(
+            state["model_updates"]
+        )
 
         self.scaler = None
 
@@ -641,7 +775,8 @@ class LearningEngine:
                 os.path.exists(
                     MODEL_FILE
                 )
-                and os.path.exists(
+                and
+                os.path.exists(
                     SCALER_FILE
                 )
             ):
@@ -754,6 +889,9 @@ class LearningEngine:
 
     def train(self):
 
+        if db is None:
+            return False
+
         rows = db.execute("""
             SELECT
                 entry_features,
@@ -790,7 +928,7 @@ class LearningEngine:
 
                 y.append(
                     1
-                    if row["profit"] > 0
+                    if float(row["profit"]) > 0
                     else 0
                 )
 
@@ -894,12 +1032,15 @@ class LearningEngine:
                     self.features_to_vector(
                         features
                     )
-                ]
+                ],
+                dtype=float
             )
+
 
             scaled = self.scaler.transform(
                 vector
             )
+
 
             probabilities = (
                 self.model.predict_proba(
@@ -907,9 +1048,11 @@ class LearningEngine:
                 )[0]
             )
 
+
             classes = list(
                 self.model.classes_
             )
+
 
             if 1 in classes:
 
@@ -970,11 +1113,37 @@ class LearningEngine:
         )
 
 
-        # Переобучаем модель
-        # после каждой закрытой сделки.
+        # Переобучаем модель после сделки.
 
-        self.train()
+        try:
 
+            self.train()
+
+        except Exception as e:
+
+            print(
+                "[LEARNING] training error:",
+                e
+            )
+
+
+# ============================================================
+# GLOBAL WALLET STATE
+# ============================================================
+
+wallet_state = {
+    "usdt": START_BALANCE,
+    "realized_profit": 0.0,
+    "total_fees": 0.0
+}
+
+wallet_usdt = START_BALANCE
+
+wallet_realized_profit = 0.0
+
+wallet_total_fees = 0.0
+
+positions = {}
 
 learning = None
 
@@ -1076,6 +1245,7 @@ def symbol_exists(
     )
 
     if not market:
+
         return False
 
     if market.get(
@@ -1127,16 +1297,19 @@ async def fetch_exchange_tickers(
 
     try:
 
-        # Пакетный запрос,
-        # если биржа его поддерживает.
-
         if exchange.has.get(
             "fetchTickers"
         ):
 
-            tickers = await exchange.fetch_tickers(
-                available
-            )
+            try:
+
+                tickers = await exchange.fetch_tickers(
+                    available
+                )
+
+            except Exception:
+
+                tickers = await exchange.fetch_tickers()
 
         else:
 
@@ -1192,7 +1365,12 @@ async def fetch_exchange_tickers(
 
         for symbol, ticker in tickers.items():
 
+            if symbol not in available:
+
+                continue
+
             if not ticker:
+
                 continue
 
 
@@ -1210,15 +1388,36 @@ async def fetch_exchange_tickers(
 
 
             if not last:
+
                 continue
 
 
             if not bid:
+
                 bid = last
 
 
             if not ask:
+
                 ask = last
+
+
+            try:
+
+                last = float(last)
+
+                bid = float(bid)
+
+                ask = float(ask)
+
+            except Exception:
+
+                continue
+
+
+            if last <= 0:
+
+                continue
 
 
             result[
@@ -1226,9 +1425,9 @@ async def fetch_exchange_tickers(
             ] = MarketData(
                 symbol=symbol,
                 exchange=exchange_id.upper(),
-                price=float(last),
-                bid=float(bid),
-                ask=float(ask),
+                price=last,
+                bid=bid,
+                ask=ask,
                 volume=float(
                     ticker.get(
                         "quoteVolume"
@@ -1252,7 +1451,7 @@ async def fetch_exchange_tickers(
 
 
 # ============================================================
-# FETCH ALL
+# FETCH ALL MARKET DATA
 # ============================================================
 
 async def fetch_market():
@@ -1268,6 +1467,11 @@ async def fetch_market():
     ]
 
 
+    if not tasks:
+
+        return {}
+
+
     responses = await asyncio.gather(
         *tasks,
         return_exceptions=True
@@ -1280,6 +1484,7 @@ async def fetch_market():
             response,
             dict
         ):
+
             continue
 
 
@@ -1594,14 +1799,11 @@ def calculate_features(
 
 
     data.momentum = (
-        data.change_1m
-        * 0.5
+        data.change_1m * 0.5
         +
-        data.change_5m
-        * 0.3
+        data.change_5m * 0.3
         +
-        data.change_15m
-        * 0.2
+        data.change_15m * 0.2
     )
 
 
@@ -1742,11 +1944,20 @@ def calculate_final_score(
     )
 
 
-    ml_probability = (
-        learning.predict_probability(
-            features
+    # На старте learning может быть None.
+    # В таком случае используем обычный score.
+
+    if learning is None:
+
+        ml_probability = 0.5
+
+    else:
+
+        ml_probability = (
+            learning.predict_probability(
+                features
+            )
         )
-    )
 
 
     data.ml_probability = (
@@ -1754,15 +1965,17 @@ def calculate_final_score(
     )
 
 
-    # До обучения ML не должен
-    # блокировать торговлю.
-
-    if learning.ready:
+    if (
+        learning is not None
+        and
+        learning.ready
+    ):
 
         ml_bonus = (
             ml_probability
             - 0.5
         ) * 30
+
 
         data.final_score = max(
             0,
@@ -1903,25 +2116,6 @@ def calculate_trade_size(
 
 
 # ============================================================
-# WALLET STATE
-# ============================================================
-
-wallet_state = load_wallet_state()
-
-wallet_usdt = wallet_state["usdt"]
-
-wallet_realized_profit = (
-    wallet_state["realized_profit"]
-)
-
-wallet_total_fees = (
-    wallet_state["total_fees"]
-)
-
-positions = load_positions()
-
-
-# ============================================================
 # BUY
 # ============================================================
 
@@ -1932,6 +2126,7 @@ async def buy_asset(
 ):
 
     global wallet_usdt
+    global wallet_total_fees
 
 
     if data.symbol in positions:
@@ -1945,6 +2140,11 @@ async def buy_asset(
 
 
     if amount_usdt > wallet_usdt:
+
+        return False
+
+
+    if data.ask <= 0:
 
         return False
 
@@ -1975,8 +2175,6 @@ async def buy_asset(
 
     wallet_usdt -= total
 
-
-    global wallet_total_fees
 
     wallet_total_fees += fee
 
@@ -2090,6 +2288,11 @@ async def sell_asset(
         return False
 
 
+    if data.bid <= 0:
+
+        return False
+
+
     gross = (
         position.amount
         * data.bid
@@ -2156,15 +2359,30 @@ async def sell_asset(
     ]
 
 
-    learning.record_result(
-        profit
-    )
+    if learning is not None:
+
+        learning.record_result(
+            profit
+        )
 
 
     emoji = (
         "🟢"
         if profit >= 0
         else "🔴"
+    )
+
+
+    learning_trades = (
+        learning.total_trades
+        if learning is not None
+        else 0
+    )
+
+    learning_winrate = (
+        learning.winrate
+        if learning is not None
+        else 0
     )
 
 
@@ -2198,10 +2416,10 @@ async def sell_asset(
         f"<b>${wallet_usdt:.2f}</b>\n"
 
         f"🧠 Сделок в памяти: "
-        f"<b>{learning.total_trades}</b>\n"
+        f"<b>{learning_trades}</b>\n"
 
         f"🎯 Winrate: "
-        f"<b>{learning.winrate:.1f}%</b>\n\n"
+        f"<b>{learning_winrate:.1f}%</b>\n\n"
 
         f"⏰ {now_string()}\n"
 
@@ -2229,6 +2447,11 @@ def should_sell(
     current_price = data.price
 
 
+    if position.entry_price <= 0:
+
+        return False, ""
+
+
     pnl = (
         current_price
         - position.entry_price
@@ -2241,24 +2464,25 @@ def should_sell(
     ) / 60
 
 
-    # Take profit
+    # TAKE PROFIT
 
     if pnl >= TAKE_PROFIT_PERCENT:
 
         return True, "TAKE PROFIT"
 
 
-    # Stop loss
+    # STOP LOSS
 
     if pnl <= -STOP_LOSS_PERCENT:
 
         return True, "STOP LOSS"
 
 
-    # ML сильно изменился
+    # ML SIGNAL
 
     if (
-        learning.ready
+        learning is not None
+        and learning.ready
         and data.ml_probability < 0.35
         and pnl > 0
     ):
@@ -2266,14 +2490,14 @@ def should_sell(
         return True, "ML SIGNAL WEAKENED"
 
 
-    # Общий score
+    # SCORE
 
     if data.final_score < 40:
 
         return True, "MARKET SCORE DROPPED"
 
 
-    # Максимальное время
+    # MAX HOLD
 
     if holding_minutes >= MAX_HOLD_MINUTES:
 
@@ -2298,7 +2522,22 @@ async def trading_loop(
 
         try:
 
-            await update_market()
+            market_ok = await update_market()
+
+
+            if not market_ok:
+
+                await show_dashboard(
+                    chat_id,
+                    "⚠️ <b>Не удалось получить рынок</b>\n\n"
+                    "Повторяю попытку..."
+                )
+
+                await asyncio.sleep(
+                    SCAN_INTERVAL
+                )
+
+                continue
 
 
             # =================================================
@@ -2314,6 +2553,7 @@ async def trading_loop(
                 )
 
                 if not position:
+
                     continue
 
 
@@ -2323,6 +2563,7 @@ async def trading_loop(
 
 
                 if not data:
+
                     continue
 
 
@@ -2370,7 +2611,8 @@ async def trading_loop(
 
 
                 if (
-                    learning.ready
+                    learning is not None
+                    and learning.ready
                     and
                     data.ml_probability
                     < MIN_ML_PROBABILITY
@@ -2428,8 +2670,22 @@ async def trading_loop(
 
             print(
                 "[TRADING ERROR]",
-                e
+                repr(e)
             )
+
+
+            try:
+
+                await show_dashboard(
+                    chat_id,
+                    "⚠️ <b>Ошибка торгового цикла</b>\n\n"
+                    f"<code>{str(e)[:1000]}</code>\n\n"
+                    "Бот продолжит работу."
+                )
+
+            except Exception:
+
+                pass
 
 
         await asyncio.sleep(
@@ -2465,9 +2721,18 @@ async def update_market():
 
     for data in latest_market.values():
 
-        calculate_final_score(
-            data
-        )
+        try:
+
+            calculate_final_score(
+                data
+            )
+
+        except Exception as e:
+
+            print(
+                "[FEATURE ERROR]",
+                e
+            )
 
 
     market_updates += 1
@@ -2477,7 +2742,7 @@ async def update_market():
 
 
 # ============================================================
-# DASHBOARD
+# PORTFOLIO VALUE
 # ============================================================
 
 def portfolio_value():
@@ -2500,19 +2765,52 @@ def portfolio_value():
 
         if candidates:
 
-            price = max(
-                candidates,
-                key=lambda x: x.price
-            ).price
+            # Используем медиану,
+            # чтобы не завышать стоимость портфеля.
 
-            value += (
-                position.amount
-                * price
+            prices = sorted(
+                data.price
+                for data in candidates
+                if data.price > 0
             )
+
+
+            if prices:
+
+                middle = len(prices) // 2
+
+                if len(prices) % 2:
+
+                    price = prices[middle]
+
+                else:
+
+                    price = (
+                        prices[middle - 1]
+                        + prices[middle]
+                    ) / 2
+
+            else:
+
+                price = position.entry_price
+
+        else:
+
+            price = position.entry_price
+
+
+        value += (
+            position.amount
+            * price
+        )
 
 
     return value
 
+
+# ============================================================
+# DASHBOARD TEXT
+# ============================================================
 
 def dashboard_text():
 
@@ -2529,6 +2827,41 @@ def dashboard_text():
         pnl
         / START_BALANCE
         * 100
+    )
+
+
+    total_trades = (
+        learning.total_trades
+        if learning is not None
+        else 0
+    )
+
+
+    winrate = (
+        learning.winrate
+        if learning is not None
+        else 0
+    )
+
+
+    total_profit = (
+        learning.total_profit
+        if learning is not None
+        else wallet_realized_profit
+    )
+
+
+    model_ready = (
+        learning.ready
+        if learning is not None
+        else False
+    )
+
+
+    model_updates = (
+        learning.model_updates
+        if learning is not None
+        else 0
     )
 
 
@@ -2558,19 +2891,19 @@ def dashboard_text():
         f"<b>{market_updates}</b>\n\n"
 
         f"📊 Сделок: "
-        f"<b>{learning.total_trades}</b>\n"
+        f"<b>{total_trades}</b>\n"
 
         f"🎯 Winrate: "
-        f"<b>{learning.winrate:.1f}%</b>\n"
+        f"<b>{winrate:.1f}%</b>\n"
 
         f"💰 Реализовано: "
-        f"<b>{learning.total_profit:+.2f}$</b>\n\n"
+        f"<b>{total_profit:+.2f}$</b>\n\n"
 
         f"🧠 ML модель: "
-        f"<b>{'🟢 ACTIVE' if learning.ready else '🟡 Сбор данных'}</b>\n"
+        f"<b>{'🟢 ACTIVE' if model_ready else '🟡 Сбор данных'}</b>\n"
 
         f"🧠 Обновлений модели: "
-        f"<b>{learning.model_updates}</b>\n\n"
+        f"<b>{model_updates}</b>\n\n"
 
         f"⚙️ Автотрейдинг: "
         f"<b>{'🟢 ON' if auto_running else '🔴 OFF'}</b>\n\n"
@@ -2578,6 +2911,9 @@ def dashboard_text():
         "🟡 <b>PAPER MODE</b>\n"
         "Реальные ордера отключены."
     )
+
+
+    return text
 
 
 # ============================================================
@@ -2626,6 +2962,11 @@ async def show_dashboard(
     text=None
 ):
 
+    if bot is None:
+
+        return
+
+
     if text is None:
 
         text = dashboard_text()
@@ -2665,10 +3006,45 @@ async def show_dashboard(
 
     except Exception as e:
 
-        print(
-            "[DASHBOARD EDIT]",
-            e
-        )
+        error_text = str(e).lower()
+
+
+        # Сообщение могло быть удалено.
+        # В таком случае создаём новое.
+
+        if (
+            "message to edit not found"
+            in error_text
+            or
+            "message can't be edited"
+            in error_text
+        ):
+
+            try:
+
+                message = await bot.send_message(
+                    chat_id,
+                    text,
+                    reply_markup=keyboard()
+                )
+
+                dashboard_messages[
+                    chat_id
+                ] = message.message_id
+
+            except Exception as send_error:
+
+                print(
+                    "[DASHBOARD SEND]",
+                    send_error
+                )
+
+        else:
+
+            print(
+                "[DASHBOARD EDIT]",
+                e
+            )
 
 
 # ============================================================
@@ -2678,6 +3054,11 @@ async def show_dashboard(
 async def send_event(
     text
 ):
+
+    if bot is None:
+
+        return
+
 
     for chat_id in list(
         dashboard_messages.keys()
@@ -2699,7 +3080,7 @@ async def send_event(
 
 
 # ============================================================
-# START
+# START COMMAND
 # ============================================================
 
 @dp.message(
@@ -2709,6 +3090,36 @@ async def start_command(
     message: Message
 ):
 
+    # Не удаляем /start сразу:
+    # сначала убеждаемся, что dashboard отправился.
+
+    try:
+
+        await show_dashboard(
+            message.chat.id
+        )
+
+    except Exception as e:
+
+        print(
+            "[START ERROR]",
+            repr(e)
+        )
+
+        try:
+
+            await message.answer(
+                "⚠️ Ошибка запуска панели:\n"
+                f"<code>{str(e)[:1000]}</code>"
+            )
+
+        except Exception:
+
+            pass
+
+        return
+
+
     try:
 
         await message.delete()
@@ -2716,11 +3127,6 @@ async def start_command(
     except Exception:
 
         pass
-
-
-    await show_dashboard(
-        message.chat.id
-    )
 
 
 # ============================================================
@@ -2739,7 +3145,16 @@ async def refresh(
     )
 
 
-    await update_market()
+    try:
+
+        await update_market()
+
+    except Exception as e:
+
+        print(
+            "[REFRESH ERROR]",
+            e
+        )
 
 
     await show_dashboard(
@@ -2782,7 +3197,8 @@ async def start_auto(
     await show_dashboard(
         callback.message.chat.id,
         "🟢 <b>АВТОТРЕЙДИНГ ЗАПУЩЕН</b>\n\n"
-        "Начинаю анализ 50 активов."
+        "Начинаю анализ 50 активов.\n"
+        "Режим: PAPER."
     )
 
 
@@ -2880,10 +3296,22 @@ async def wallet_callback(
 
             if candidates:
 
-                current = max(
-                    candidates,
-                    key=lambda x: x.price
-                ).price
+                prices = [
+                    x.price
+                    for x in candidates
+                    if x.price > 0
+                ]
+
+                if prices:
+
+                    current = (
+                        sum(prices)
+                        / len(prices)
+                    )
+
+                else:
+
+                    current = position.entry_price
 
             else:
 
@@ -2987,6 +3415,13 @@ async def market(
         )
 
 
+    if len(lines) == 2:
+
+        lines.append(
+            "⏳ Данные рынка ещё загружаются."
+        )
+
+
     await show_dashboard(
         callback.message.chat.id,
         "\n".join(lines)
@@ -3072,6 +3507,17 @@ async def learning_callback(
     await callback.answer()
 
 
+    if learning is None:
+
+        await show_dashboard(
+            callback.message.chat.id,
+            "🧠 <b>ПАМЯТЬ И ОБУЧЕНИЕ</b>\n\n"
+            "Модуль обучения ещё запускается."
+        )
+
+        return
+
+
     text = (
         "🧠 <b>ПАМЯТЬ И ОБУЧЕНИЕ</b>\n\n"
 
@@ -3130,16 +3576,25 @@ async def fallback(
 
     try:
 
+        await show_dashboard(
+            message.chat.id
+        )
+
+    except Exception as e:
+
+        print(
+            "[FALLBACK ERROR]",
+            e
+        )
+
+
+    try:
+
         await message.delete()
 
     except Exception:
 
         pass
-
-
-    await show_dashboard(
-        message.chat.id
-    )
 
 
 # ============================================================
@@ -3176,30 +3631,47 @@ async def main():
 
     global bot
     global learning
+
     global wallet_state
     global wallet_usdt
     global wallet_realized_profit
     global wallet_total_fees
+
     global positions
 
+    global auto_running
+    global auto_task
 
-    # --------------------------------------------------------
-    # DATABASE MUST BE INITIALIZED FIRST
-    # --------------------------------------------------------
+
+    # ========================================================
+    # 1. BOT TOKEN
+    # ========================================================
+
+    if not BOT_TOKEN:
+
+        raise RuntimeError(
+            "BOT_TOKEN отсутствует в .env"
+        )
+
+
+    # ========================================================
+    # 2. DATABASE FIRST
+    # ========================================================
+
+    print(
+        "[STARTUP] Initializing database..."
+    )
 
     init_database()
 
 
-    # --------------------------------------------------------
-    # NOW LEARNING CAN BE CREATED
-    # --------------------------------------------------------
+    # ========================================================
+    # 3. LOAD WALLET
+    # ========================================================
 
-    learning = LearningEngine()
-
-
-    # --------------------------------------------------------
-    # LOAD WALLET
-    # --------------------------------------------------------
+    print(
+        "[STARTUP] Loading wallet..."
+    )
 
     wallet_state = load_wallet_state()
 
@@ -3220,19 +3692,31 @@ async def main():
     )
 
 
-    # --------------------------------------------------------
-    # LOAD POSITIONS
-    # --------------------------------------------------------
+    # ========================================================
+    # 4. LOAD POSITIONS
+    # ========================================================
+
+    print(
+        "[STARTUP] Loading positions..."
+    )
 
     positions = load_positions()
 
 
-    if not BOT_TOKEN:
+    # ========================================================
+    # 5. CREATE LEARNING
+    # ========================================================
 
-        raise RuntimeError(
-            "BOT_TOKEN отсутствует в .env"
-        )
+    print(
+        "[STARTUP] Loading learning..."
+    )
 
+    learning = LearningEngine()
+
+
+    # ========================================================
+    # 6. CREATE TELEGRAM BOT
+    # ========================================================
 
     bot = Bot(
         token=BOT_TOKEN,
@@ -3241,6 +3725,10 @@ async def main():
         )
     )
 
+
+    # ========================================================
+    # STARTUP INFO
+    # ========================================================
 
     print("=" * 70)
 
@@ -3286,6 +3774,11 @@ async def main():
     )
 
     print(
+        "Open positions:",
+        len(positions)
+    )
+
+    print(
         "LIVE TRADING:",
         LIVE_TRADING
     )
@@ -3293,16 +3786,52 @@ async def main():
     print("=" * 70)
 
 
-    # --------------------------------------------------------
-    # EXCHANGES
-    # --------------------------------------------------------
+    # ========================================================
+    # 7. REMOVE OLD WEBHOOK
+    # ========================================================
+
+    try:
+
+        await bot.delete_webhook(
+            drop_pending_updates=True
+        )
+
+        print(
+            "[TELEGRAM] webhook cleared"
+        )
+
+    except Exception as e:
+
+        print(
+            "[TELEGRAM] webhook error:",
+            e
+        )
+
+
+    # ========================================================
+    # 8. EXCHANGES
+    # ========================================================
+
+    print(
+        "[STARTUP] Initializing exchanges..."
+    )
+
 
     await initialize_exchanges()
 
 
     print(
-        "Active exchanges:",
+        "[STARTUP] Active exchanges:",
         len(exchanges)
+    )
+
+
+    # ========================================================
+    # 9. START TELEGRAM
+    # ========================================================
+
+    print(
+        "[TELEGRAM] Starting polling..."
     )
 
 
@@ -3315,7 +3844,9 @@ async def main():
 
     finally:
 
-        global auto_running
+        # ====================================================
+        # STOP TRADING
+        # ====================================================
 
         auto_running = False
 
@@ -3324,6 +3855,20 @@ async def main():
 
             auto_task.cancel()
 
+            try:
+
+                await auto_task
+
+            except asyncio.CancelledError:
+
+                pass
+
+            auto_task = None
+
+
+        # ====================================================
+        # CLOSE EXCHANGES
+        # ====================================================
 
         for exchange in exchanges.values():
 
@@ -3331,17 +3876,47 @@ async def main():
 
                 await exchange.close()
 
+            except Exception as e:
+
+                print(
+                    "[EXCHANGE CLOSE]",
+                    e
+                )
+
+
+        # ====================================================
+        # CLOSE TELEGRAM
+        # ====================================================
+
+        if bot:
+
+            try:
+
+                await bot.session.close()
+
             except Exception:
 
                 pass
 
 
-        await bot.session.close()
-
+        # ====================================================
+        # CLOSE DATABASE
+        # ====================================================
 
         if db:
 
-            db.close()
+            try:
+
+                db.close()
+
+            except Exception:
+
+                pass
+
+
+        print(
+            "[SHUTDOWN] Bot stopped."
+        )
 
 
 # ============================================================
@@ -3350,6 +3925,34 @@ async def main():
 
 if __name__ == "__main__":
 
-    asyncio.run(
-        main()
-    )
+    try:
+
+        asyncio.run(
+            main()
+        )
+
+    except KeyboardInterrupt:
+
+        print(
+            "Bot stopped manually."
+        )
+
+    except Exception as e:
+
+        print(
+            "=" * 70
+        )
+
+        print(
+            "FATAL ERROR:"
+        )
+
+        print(
+            repr(e)
+        )
+
+        print(
+            "=" * 70
+        )
+
+        raise
