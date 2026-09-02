@@ -1,21 +1,26 @@
 import asyncio
+import json
+import math
 import os
 import sqlite3
 import time
-import json
-import math
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
 import ccxt.async_support as ccxt
+import joblib
+import numpy as np
+
+from sklearn.linear_model import SGDClassifier
+from sklearn.preprocessing import StandardScaler
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from dotenv import load_dotenv
 
@@ -44,6 +49,14 @@ MAX_TRADE_PERCENT = float(
     os.getenv("MAX_TRADE_PERCENT", "35")
 )
 
+MIN_TRADE_SCORE = float(
+    os.getenv("MIN_TRADE_SCORE", "63")
+)
+
+MIN_ML_PROBABILITY = float(
+    os.getenv("MIN_ML_PROBABILITY", "0.55")
+)
+
 TAKE_PROFIT_PERCENT = float(
     os.getenv("TAKE_PROFIT_PERCENT", "2.0")
 )
@@ -56,26 +69,35 @@ MAX_HOLD_MINUTES = int(
     os.getenv("MAX_HOLD_MINUTES", "240")
 )
 
-BUY_SCORE = float(
-    os.getenv("BUY_SCORE", "64")
-)
-
-SELL_SCORE = float(
-    os.getenv("SELL_SCORE", "43")
-)
-
 FEE_PERCENT = float(
     os.getenv("FEE_PERCENT", "0.10")
 )
 
-DB_FILE = os.getenv(
+DATABASE_FILE = os.getenv(
     "DATABASE_FILE",
     "trader_memory.db"
 )
 
+MODEL_FILE = os.getenv(
+    "MODEL_FILE",
+    "trader_model.pkl"
+)
+
+SCALER_FILE = os.getenv(
+    "SCALER_FILE",
+    "trader_scaler.pkl"
+)
+
 
 # ============================================================
-# 50 ASSETS
+# PAPER MODE
+# ============================================================
+
+LIVE_TRADING = False
+
+
+# ============================================================
+# 50 CRYPTOCURRENCIES
 # ============================================================
 
 SYMBOLS = [
@@ -137,7 +159,7 @@ SYMBOLS = [
 
 
 # ============================================================
-# 20 PUBLIC MARKET VENUES
+# 20 EXCHANGES
 # ============================================================
 
 EXCHANGE_IDS = [
@@ -165,30 +187,18 @@ EXCHANGE_IDS = [
 
 
 # ============================================================
-# PAPER ONLY
-# ============================================================
-
-LIVE_TRADING = False
-
-
-# ============================================================
-# TELEGRAM
+# GLOBALS
 # ============================================================
 
 bot: Optional[Bot] = None
 
 dp = Dispatcher()
 
+db = None
+
+exchanges = {}
+
 dashboard_messages = {}
-
-auto_running = False
-
-auto_task = None
-
-
-# ============================================================
-# GLOBAL MARKET STATE
-# ============================================================
 
 latest_market = {}
 
@@ -196,45 +206,363 @@ price_history = {}
 
 market_updates = 0
 
-last_scan_time = 0
+auto_running = False
+
+auto_task = None
 
 
 # ============================================================
-# EXCHANGE OBJECTS
+# DATABASE
 # ============================================================
 
-exchanges = {}
+def init_database():
+
+    global db
+
+    db = sqlite3.connect(
+        DATABASE_FILE,
+        check_same_thread=False
+    )
+
+    db.row_factory = sqlite3.Row
+
+    cursor = db.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS wallet (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            usdt REAL NOT NULL,
+            realized_profit REAL NOT NULL DEFAULT 0,
+            total_fees REAL NOT NULL DEFAULT 0
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS positions (
+            symbol TEXT PRIMARY KEY,
+            exchange TEXT NOT NULL,
+            amount REAL NOT NULL,
+            entry_price REAL NOT NULL,
+            invested REAL NOT NULL,
+            opened_at REAL NOT NULL,
+            entry_score REAL NOT NULL,
+            ml_probability REAL NOT NULL,
+            features TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            symbol TEXT NOT NULL,
+            exchange TEXT NOT NULL,
+
+            entry_price REAL NOT NULL,
+            exit_price REAL NOT NULL,
+
+            amount REAL NOT NULL,
+            invested REAL NOT NULL,
+
+            profit REAL NOT NULL,
+            profit_percent REAL NOT NULL,
+
+            reason TEXT,
+
+            entry_score REAL,
+            exit_score REAL,
+
+            ml_probability REAL,
+
+            entry_features TEXT,
+
+            opened_at REAL,
+            closed_at REAL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS learning_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+
+            total_trades INTEGER NOT NULL DEFAULT 0,
+            wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0,
+
+            total_profit REAL NOT NULL DEFAULT 0,
+
+            best_trade REAL NOT NULL DEFAULT 0,
+            worst_trade REAL NOT NULL DEFAULT 0,
+
+            model_updates INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_memory (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    cursor.execute("""
+        INSERT OR IGNORE INTO wallet (
+            id,
+            usdt,
+            realized_profit,
+            total_fees
+        )
+        VALUES (1, ?, 0, 0)
+    """, (
+        START_BALANCE,
+    ))
+
+    cursor.execute("""
+        INSERT OR IGNORE INTO learning_state (
+            id
+        )
+        VALUES (1)
+    """)
+
+    db.commit()
 
 
 # ============================================================
-# DATA CLASSES
+# WALLET DATABASE
 # ============================================================
 
-@dataclass
-class MarketData:
+def load_wallet_state():
 
-    symbol: str
+    row = db.execute("""
+        SELECT *
+        FROM wallet
+        WHERE id = 1
+    """).fetchone()
 
-    exchange: str
+    return {
+        "usdt": row["usdt"],
+        "realized_profit": row["realized_profit"],
+        "total_fees": row["total_fees"]
+    }
 
-    price: float
 
-    bid: float
+def save_wallet_state(
+    usdt,
+    realized_profit,
+    total_fees
+):
 
-    ask: float
+    db.execute("""
+        UPDATE wallet
+        SET
+            usdt = ?,
+            realized_profit = ?,
+            total_fees = ?
+        WHERE id = 1
+    """, (
+        usdt,
+        realized_profit,
+        total_fees
+    ))
 
-    timestamp: float
+    db.commit()
 
-    change_1m: float = 0.0
 
-    change_5m: float = 0.0
+# ============================================================
+# POSITION DATABASE
+# ============================================================
 
-    volatility: float = 0.0
+def save_position(position):
 
-    spread: float = 0.0
+    db.execute("""
+        INSERT OR REPLACE INTO positions (
+            symbol,
+            exchange,
+            amount,
+            entry_price,
+            invested,
+            opened_at,
+            entry_score,
+            ml_probability,
+            features
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        position.symbol,
+        position.exchange,
+        position.amount,
+        position.entry_price,
+        position.invested,
+        position.opened_at,
+        position.entry_score,
+        position.ml_probability,
+        json.dumps(
+            position.features
+        )
+    ))
 
-    score: float = 0.0
+    db.commit()
 
+
+def delete_position(symbol):
+
+    db.execute("""
+        DELETE FROM positions
+        WHERE symbol = ?
+    """, (
+        symbol,
+    ))
+
+    db.commit()
+
+
+def load_positions():
+
+    rows = db.execute("""
+        SELECT *
+        FROM positions
+    """).fetchall()
+
+    positions = {}
+
+    for row in rows:
+
+        positions[
+            row["symbol"]
+        ] = Position(
+            symbol=row["symbol"],
+            exchange=row["exchange"],
+            amount=row["amount"],
+            entry_price=row["entry_price"],
+            invested=row["invested"],
+            opened_at=row["opened_at"],
+            entry_score=row["entry_score"],
+            ml_probability=row["ml_probability"],
+            features=json.loads(
+                row["features"]
+            )
+        )
+
+    return positions
+
+
+# ============================================================
+# LEARNING DATABASE
+# ============================================================
+
+def load_learning_state():
+
+    row = db.execute("""
+        SELECT *
+        FROM learning_state
+        WHERE id = 1
+    """).fetchone()
+
+    return row
+
+
+def save_learning_state(
+    total_trades,
+    wins,
+    losses,
+    total_profit,
+    best_trade,
+    worst_trade,
+    model_updates
+):
+
+    db.execute("""
+        UPDATE learning_state
+        SET
+            total_trades = ?,
+            wins = ?,
+            losses = ?,
+            total_profit = ?,
+            best_trade = ?,
+            worst_trade = ?,
+            model_updates = ?
+        WHERE id = 1
+    """, (
+        total_trades,
+        wins,
+        losses,
+        total_profit,
+        best_trade,
+        worst_trade,
+        model_updates
+    ))
+
+    db.commit()
+
+
+# ============================================================
+# TRADE DATABASE
+# ============================================================
+
+def save_trade(
+    position,
+    exit_price,
+    profit,
+    profit_percent,
+    reason,
+    exit_score
+):
+
+    db.execute("""
+        INSERT INTO trades (
+            symbol,
+            exchange,
+            entry_price,
+            exit_price,
+            amount,
+            invested,
+            profit,
+            profit_percent,
+            reason,
+            entry_score,
+            exit_score,
+            ml_probability,
+            entry_features,
+            opened_at,
+            closed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        position.symbol,
+        position.exchange,
+        position.entry_price,
+        exit_price,
+        position.amount,
+        position.invested,
+        profit,
+        profit_percent,
+        reason,
+        position.entry_score,
+        exit_score,
+        position.ml_probability,
+        json.dumps(
+            position.features
+        ),
+        position.opened_at,
+        time.time()
+    ))
+
+    db.commit()
+
+
+def get_trades():
+
+    return db.execute("""
+        SELECT *
+        FROM trades
+        ORDER BY id DESC
+        LIMIT 20
+    """).fetchall()
+
+
+# ============================================================
+# POSITION
+# ============================================================
 
 @dataclass
 class Position:
@@ -253,637 +581,524 @@ class Position:
 
     entry_score: float
 
-    best_price: float = 0.0
+    ml_probability: float
+
+    features: dict
 
 
 # ============================================================
-# LEARNING STATE
+# LEARNING ENGINE
 # ============================================================
 
-class LearningState:
+class LearningEngine:
 
     def __init__(self):
 
-        self.total_trades = 0
+        state = load_learning_state()
 
-        self.winning_trades = 0
+        self.total_trades = state["total_trades"]
 
-        self.losing_trades = 0
+        self.wins = state["wins"]
 
-        self.total_profit = 0.0
+        self.losses = state["losses"]
 
-        self.best_trade = 0.0
+        self.total_profit = state["total_profit"]
 
-        self.worst_trade = 0.0
+        self.best_trade = state["best_trade"]
 
-        self.score_adjustment = 0.0
+        self.worst_trade = state["worst_trade"]
 
-        self.good_patterns = 0
+        self.model_updates = state["model_updates"]
 
-        self.bad_patterns = 0
+        self.scaler = None
 
-        self.load()
+        self.model = None
+
+        self.ready = False
+
+        self.load_model()
 
 
     @property
     def winrate(self):
 
         if self.total_trades == 0:
+
             return 0
 
         return (
-            self.winning_trades
+            self.wins
             / self.total_trades
             * 100
         )
 
 
-    def load(self):
+    def load_model(self):
 
-        data = db_get_learning()
+        try:
 
-        if not data:
-            return
+            if (
+                os.path.exists(
+                    MODEL_FILE
+                )
+                and os.path.exists(
+                    SCALER_FILE
+                )
+            ):
 
-        self.total_trades = data["total_trades"]
+                self.model = joblib.load(
+                    MODEL_FILE
+                )
 
-        self.winning_trades = data["winning_trades"]
+                self.scaler = joblib.load(
+                    SCALER_FILE
+                )
 
-        self.losing_trades = data["losing_trades"]
+                self.ready = True
 
-        self.total_profit = data["total_profit"]
+                print(
+                    "[LEARNING] model loaded"
+                )
 
-        self.best_trade = data["best_trade"]
+        except Exception as e:
 
-        self.worst_trade = data["worst_trade"]
+            print(
+                "[LEARNING] model load error:",
+                e
+            )
 
-        self.score_adjustment = data["score_adjustment"]
+            self.model = None
 
-        self.good_patterns = data["good_patterns"]
+            self.scaler = None
 
-        self.bad_patterns = data["bad_patterns"]
-
-
-    def save(self):
-
-        db_save_learning(self)
+            self.ready = False
 
 
-    def learn(
+    def features_to_vector(
         self,
-        profit,
-        entry_score,
-        change_1m,
-        change_5m,
-        volatility
+        features
+    ):
+
+        return [
+            float(
+                features.get(
+                    "change_1m",
+                    0
+                )
+            ),
+
+            float(
+                features.get(
+                    "change_5m",
+                    0
+                )
+            ),
+
+            float(
+                features.get(
+                    "change_15m",
+                    0
+                )
+            ),
+
+            float(
+                features.get(
+                    "volatility",
+                    0
+                )
+            ),
+
+            float(
+                features.get(
+                    "spread",
+                    0
+                )
+            ),
+
+            float(
+                features.get(
+                    "momentum",
+                    0
+                )
+            ),
+
+            float(
+                features.get(
+                    "rsi",
+                    50
+                )
+            ),
+
+            float(
+                features.get(
+                    "base_score",
+                    50
+                )
+            ),
+
+            float(
+                features.get(
+                    "hour_sin",
+                    0
+                )
+            ),
+
+            float(
+                features.get(
+                    "hour_cos",
+                    0
+                )
+            )
+        ]
+
+
+    def train(self):
+
+        rows = db.execute("""
+            SELECT
+                entry_features,
+                profit
+            FROM trades
+            WHERE entry_features IS NOT NULL
+            ORDER BY id ASC
+        """).fetchall()
+
+
+        if len(rows) < 10:
+
+            return False
+
+
+        X = []
+
+        y = []
+
+
+        for row in rows:
+
+            try:
+
+                features = json.loads(
+                    row["entry_features"]
+                )
+
+                X.append(
+                    self.features_to_vector(
+                        features
+                    )
+                )
+
+                y.append(
+                    1
+                    if row["profit"] > 0
+                    else 0
+                )
+
+            except Exception:
+
+                continue
+
+
+        if len(X) < 10:
+
+            return False
+
+
+        if len(set(y)) < 2:
+
+            return False
+
+
+        X = np.asarray(
+            X,
+            dtype=float
+        )
+
+        y = np.asarray(
+            y,
+            dtype=int
+        )
+
+
+        self.scaler = StandardScaler()
+
+        X_scaled = self.scaler.fit_transform(
+            X
+        )
+
+
+        self.model = SGDClassifier(
+            loss="log_loss",
+            penalty="l2",
+            alpha=0.0005,
+            max_iter=1000,
+            random_state=42,
+            class_weight="balanced"
+        )
+
+
+        self.model.fit(
+            X_scaled,
+            y
+        )
+
+
+        joblib.dump(
+            self.model,
+            MODEL_FILE
+        )
+
+        joblib.dump(
+            self.scaler,
+            SCALER_FILE
+        )
+
+
+        self.ready = True
+
+        self.model_updates += 1
+
+
+        save_learning_state(
+            self.total_trades,
+            self.wins,
+            self.losses,
+            self.total_profit,
+            self.best_trade,
+            self.worst_trade,
+            self.model_updates
+        )
+
+
+        print(
+            "[LEARNING] model updated"
+        )
+
+        return True
+
+
+    def predict_probability(
+        self,
+        features
+    ):
+
+        if not self.ready:
+
+            return 0.5
+
+
+        try:
+
+            vector = np.asarray(
+                [
+                    self.features_to_vector(
+                        features
+                    )
+                ]
+            )
+
+            scaled = self.scaler.transform(
+                vector
+            )
+
+            probabilities = (
+                self.model.predict_proba(
+                    scaled
+                )[0]
+            )
+
+            classes = list(
+                self.model.classes_
+            )
+
+            if 1 in classes:
+
+                index = classes.index(1)
+
+                return float(
+                    probabilities[index]
+                )
+
+        except Exception as e:
+
+            print(
+                "[LEARNING] prediction error:",
+                e
+            )
+
+
+        return 0.5
+
+
+    def record_result(
+        self,
+        profit
     ):
 
         self.total_trades += 1
 
         self.total_profit += profit
 
-        if profit >= 0:
 
-            self.winning_trades += 1
+        if profit > 0:
+
+            self.wins += 1
 
             self.best_trade = max(
                 self.best_trade,
                 profit
             )
 
-            self.good_patterns += 1
-
-            self.score_adjustment += 0.15
-
-            self.score_adjustment = min(
-                self.score_adjustment,
-                8
-            )
-
-            db_save_pattern(
-                result="WIN",
-                score=entry_score,
-                change_1m=change_1m,
-                change_5m=change_5m,
-                volatility=volatility
-            )
-
         else:
 
-            self.losing_trades += 1
+            self.losses += 1
 
             self.worst_trade = min(
                 self.worst_trade,
                 profit
             )
 
-            self.bad_patterns += 1
 
-            self.score_adjustment -= 0.20
-
-            self.score_adjustment = max(
-                self.score_adjustment,
-                -8
-            )
-
-            db_save_pattern(
-                result="LOSS",
-                score=entry_score,
-                change_1m=change_1m,
-                change_5m=change_5m,
-                volatility=volatility
-            )
-
-        self.save()
+        save_learning_state(
+            self.total_trades,
+            self.wins,
+            self.losses,
+            self.total_profit,
+            self.best_trade,
+            self.worst_trade,
+            self.model_updates
+        )
 
 
-learning = LearningState()
+        # Переобучаем модель
+        # после каждой закрытой сделки.
+
+        self.train()
+
+
+learning = None
 
 
 # ============================================================
-# DATABASE
+# MARKET DATA
 # ============================================================
 
-db = sqlite3.connect(
-    DB_FILE,
-    check_same_thread=False
-)
+@dataclass
+class MarketData:
 
-db.row_factory = sqlite3.Row
+    symbol: str
 
+    exchange: str
 
-def db_init():
+    price: float
 
-    cursor = db.cursor()
+    bid: float
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ask: float
 
-            symbol TEXT NOT NULL,
+    volume: float
 
-            exchange TEXT NOT NULL,
+    timestamp: float
 
-            entry_price REAL NOT NULL,
+    change_1m: float = 0
 
-            exit_price REAL,
+    change_5m: float = 0
 
-            amount REAL NOT NULL,
+    change_15m: float = 0
 
-            invested REAL NOT NULL,
+    volatility: float = 0
 
-            result REAL,
+    spread: float = 0
 
-            result_percent REAL,
+    momentum: float = 0
 
-            reason TEXT,
+    rsi: float = 50
 
-            entry_score REAL,
+    base_score: float = 50
 
-            exit_score REAL,
+    ml_probability: float = 0
 
-            opened_at TEXT,
-
-            closed_at TEXT
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS patterns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-            result TEXT NOT NULL,
-
-            score REAL,
-
-            change_1m REAL,
-
-            change_5m REAL,
-
-            volatility REAL,
-
-            created_at TEXT
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS learning (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-
-            total_trades INTEGER,
-
-            winning_trades INTEGER,
-
-            losing_trades INTEGER,
-
-            total_profit REAL,
-
-            best_trade REAL,
-
-            worst_trade REAL,
-
-            score_adjustment REAL,
-
-            good_patterns INTEGER,
-
-            bad_patterns INTEGER
-        )
-    """)
-
-    cursor.execute("""
-        INSERT OR IGNORE INTO learning
-        VALUES (
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0
-        )
-    """)
-
-    db.commit()
-
-
-def db_save_learning(state):
-
-    cursor = db.cursor()
-
-    cursor.execute("""
-        UPDATE learning
-        SET
-            total_trades = ?,
-            winning_trades = ?,
-            losing_trades = ?,
-            total_profit = ?,
-            best_trade = ?,
-            worst_trade = ?,
-            score_adjustment = ?,
-            good_patterns = ?,
-            bad_patterns = ?
-        WHERE id = 1
-    """, (
-        state.total_trades,
-        state.winning_trades,
-        state.losing_trades,
-        state.total_profit,
-        state.best_trade,
-        state.worst_trade,
-        state.score_adjustment,
-        state.good_patterns,
-        state.bad_patterns
-    ))
-
-    db.commit()
-
-
-def db_get_learning():
-
-    cursor = db.cursor()
-
-    row = cursor.execute(
-        "SELECT * FROM learning WHERE id = 1"
-    ).fetchone()
-
-    if not row:
-        return None
-
-    return dict(row)
-
-
-def db_save_pattern(
-    result,
-    score,
-    change_1m,
-    change_5m,
-    volatility
-):
-
-    cursor = db.cursor()
-
-    cursor.execute("""
-        INSERT INTO patterns (
-            result,
-            score,
-            change_1m,
-            change_5m,
-            volatility,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        result,
-        score,
-        change_1m,
-        change_5m,
-        volatility,
-        datetime.now().isoformat()
-    ))
-
-    db.commit()
-
-
-def db_save_trade(
-    position,
-    exit_price,
-    profit,
-    profit_percent,
-    reason,
-    exit_score
-):
-
-    cursor = db.cursor()
-
-    cursor.execute("""
-        INSERT INTO trades (
-            symbol,
-            exchange,
-            entry_price,
-            exit_price,
-            amount,
-            invested,
-            result,
-            result_percent,
-            reason,
-            entry_score,
-            exit_score,
-            opened_at,
-            closed_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        position.symbol,
-        position.exchange,
-        position.entry_price,
-        exit_price,
-        position.amount,
-        position.invested,
-        profit,
-        profit_percent,
-        reason,
-        position.entry_score,
-        exit_score,
-        datetime.fromtimestamp(
-            position.opened_at
-        ).isoformat(),
-        datetime.now().isoformat()
-    ))
-
-    db.commit()
-
-
-def db_get_recent_trades(limit=15):
-
-    cursor = db.cursor()
-
-    return cursor.execute("""
-        SELECT *
-        FROM trades
-        ORDER BY id DESC
-        LIMIT ?
-    """, (
-        limit,
-    )).fetchall()
-
-
-def db_get_pattern_stats():
-
-    cursor = db.cursor()
-
-    row = cursor.execute("""
-        SELECT
-            COUNT(*) AS total,
-
-            SUM(
-                CASE
-                    WHEN result = 'WIN'
-                    THEN 1
-                    ELSE 0
-                END
-            ) AS wins,
-
-            SUM(
-                CASE
-                    WHEN result = 'LOSS'
-                    THEN 1
-                    ELSE 0
-                END
-            ) AS losses,
-
-            AVG(
-                CASE
-                    WHEN result = 'WIN'
-                    THEN score
-                END
-            ) AS avg_win_score,
-
-            AVG(
-                CASE
-                    WHEN result = 'LOSS'
-                    THEN score
-                END
-            ) AS avg_loss_score
-
-        FROM patterns
-    """).fetchone()
-
-    return row
+    final_score: float = 50
 
 
 # ============================================================
-# WALLET
+# EXCHANGES
 # ============================================================
 
-class PaperWallet:
-
-    def __init__(self):
-
-        self.usdt = START_BALANCE
-
-        self.positions = {}
-
-        self.realized_profit = 0.0
-
-        self.total_fees = 0.0
-
-
-    def buy(
-        self,
-        symbol,
-        exchange,
-        amount_usdt,
-        price,
-        score
-    ):
-
-        if amount_usdt <= 0:
-            return False
-
-        if amount_usdt > self.usdt:
-            return False
-
-        fee = (
-            amount_usdt
-            * FEE_PERCENT
-            / 100
-        )
-
-        total = (
-            amount_usdt
-            + fee
-        )
-
-        if total > self.usdt:
-            return False
-
-        amount = (
-            amount_usdt
-            / price
-        )
-
-        self.usdt -= total
-
-        self.total_fees += fee
-
-        self.positions[symbol] = Position(
-            symbol=symbol,
-            exchange=exchange,
-            amount=amount,
-            entry_price=price,
-            invested=amount_usdt,
-            opened_at=time.time(),
-            entry_score=score,
-            best_price=price
-        )
-
-        return True
-
-
-    def sell(
-        self,
-        symbol,
-        price
-    ):
-
-        position = self.positions.get(
-            symbol
-        )
-
-        if not position:
-            return None
-
-        gross = (
-            position.amount
-            * price
-        )
-
-        fee = (
-            gross
-            * FEE_PERCENT
-            / 100
-        )
-
-        received = (
-            gross
-            - fee
-        )
-
-        profit = (
-            received
-            - position.invested
-        )
-
-        self.usdt += received
-
-        self.realized_profit += profit
-
-        self.total_fees += fee
-
-        del self.positions[symbol]
-
-        return {
-            "position": position,
-            "gross": gross,
-            "fee": fee,
-            "received": received,
-            "profit": profit
-        }
-
-
-    def equity(
-        self,
-        prices
-    ):
-
-        total = self.usdt
-
-        for symbol, position in self.positions.items():
-
-            price = prices.get(
-                symbol
-            )
-
-            if price:
-
-                total += (
-                    position.amount
-                    * price
-                )
-
-        return total
-
-
-wallet = PaperWallet()
-
-
-# ============================================================
-# EXCHANGE INITIALIZATION
-# ============================================================
-
-async def init_exchanges():
+async def initialize_exchanges():
 
     for exchange_id in EXCHANGE_IDS:
 
         try:
 
-            exchange_class = getattr(
+            cls = getattr(
                 ccxt,
                 exchange_id
             )
 
-            exchange = exchange_class({
+            exchange = cls({
                 "enableRateLimit": True,
                 "timeout": 10000,
             })
 
+
             await exchange.load_markets()
+
 
             exchanges[
                 exchange_id
             ] = exchange
 
+
             print(
-                f"[OK] {exchange_id}"
+                f"[EXCHANGE] {exchange_id}: OK"
             )
+
 
         except Exception as e:
 
             print(
-                f"[SKIP] {exchange_id}: {e}"
+                f"[EXCHANGE] {exchange_id}: SKIP - {e}"
             )
 
 
 # ============================================================
-# FETCH TICKER
+# MARKET SYMBOL
 # ============================================================
 
-async def fetch_ticker(
-    exchange_id,
+def symbol_exists(
+    exchange,
     symbol
+):
+
+    market = exchange.markets.get(
+        symbol
+    )
+
+    if not market:
+        return False
+
+    if market.get(
+        "spot"
+    ) is False:
+
+        return False
+
+    if market.get(
+        "active"
+    ) is False:
+
+        return False
+
+    return True
+
+
+# ============================================================
+# FETCH MARKET
+# ============================================================
+
+async def fetch_exchange_tickers(
+    exchange_id
 ):
 
     exchange = exchanges.get(
@@ -891,88 +1106,166 @@ async def fetch_ticker(
     )
 
     if not exchange:
-        return None
 
-    if symbol not in exchange.markets:
-        return None
+        return {}
+
+
+    available = [
+        symbol
+        for symbol in SYMBOLS
+        if symbol_exists(
+            exchange,
+            symbol
+        )
+    ]
+
+
+    if not available:
+
+        return {}
+
 
     try:
 
-        ticker = await exchange.fetch_ticker(
-            symbol
+        # Пакетный запрос,
+        # если биржа его поддерживает.
+
+        if exchange.has.get(
+            "fetchTickers"
+        ):
+
+            tickers = await exchange.fetch_tickers(
+                available
+            )
+
+        else:
+
+            tickers = {}
+
+            semaphore = asyncio.Semaphore(
+                5
+            )
+
+
+            async def fetch_one(
+                symbol
+            ):
+
+                async with semaphore:
+
+                    try:
+
+                        return (
+                            symbol,
+                            await exchange.fetch_ticker(
+                                symbol
+                            )
+                        )
+
+                    except Exception:
+
+                        return (
+                            symbol,
+                            None
+                        )
+
+
+            responses = await asyncio.gather(
+                *[
+                    fetch_one(symbol)
+                    for symbol in available
+                ]
+            )
+
+
+            for symbol, ticker in responses:
+
+                if ticker:
+
+                    tickers[
+                        symbol
+                    ] = ticker
+
+
+        result = {}
+
+
+        for symbol, ticker in tickers.items():
+
+            if not ticker:
+                continue
+
+
+            last = ticker.get(
+                "last"
+            )
+
+            bid = ticker.get(
+                "bid"
+            )
+
+            ask = ticker.get(
+                "ask"
+            )
+
+
+            if not last:
+                continue
+
+
+            if not bid:
+                bid = last
+
+
+            if not ask:
+                ask = last
+
+
+            result[
+                symbol
+            ] = MarketData(
+                symbol=symbol,
+                exchange=exchange_id.upper(),
+                price=float(last),
+                bid=float(bid),
+                ask=float(ask),
+                volume=float(
+                    ticker.get(
+                        "quoteVolume"
+                    )
+                    or 0
+                ),
+                timestamp=time.time()
+            )
+
+
+        return result
+
+
+    except Exception as e:
+
+        print(
+            f"[MARKET] {exchange_id}: {e}"
         )
 
-        bid = ticker.get(
-            "bid"
-        )
-
-        ask = ticker.get(
-            "ask"
-        )
-
-        last = ticker.get(
-            "last"
-        )
-
-        if not last:
-            return None
-
-        if not bid:
-            bid = last
-
-        if not ask:
-            ask = last
-
-        return MarketData(
-            symbol=symbol,
-            exchange=exchange_id.upper(),
-            price=float(last),
-            bid=float(bid),
-            ask=float(ask),
-            timestamp=time.time()
-        )
-
-    except Exception:
-
-        return None
+        return {}
 
 
 # ============================================================
-# FETCH ALL MARKET DATA
+# FETCH ALL
 # ============================================================
 
-async def fetch_all_market():
+async def fetch_market():
 
     result = {}
 
-    semaphore = asyncio.Semaphore(8)
 
-
-    async def worker(
-        exchange_id,
-        symbol
-    ):
-
-        async with semaphore:
-
-            return await fetch_ticker(
-                exchange_id,
-                symbol
-            )
-
-
-    tasks = []
-
-    for exchange_id in exchanges:
-
-        for symbol in SYMBOLS:
-
-            tasks.append(
-                worker(
-                    exchange_id,
-                    symbol
-                )
-            )
+    tasks = [
+        fetch_exchange_tickers(
+            exchange_id
+        )
+        for exchange_id in exchanges
+    ]
 
 
     responses = await asyncio.gather(
@@ -981,20 +1274,23 @@ async def fetch_all_market():
     )
 
 
-    for data in responses:
+    for response in responses:
 
         if not isinstance(
-            data,
-            MarketData
+            response,
+            dict
         ):
             continue
 
-        result[
-            (
-                data.symbol,
-                data.exchange
-            )
-        ] = data
+
+        for symbol, data in response.items():
+
+            result[
+                (
+                    symbol,
+                    data.exchange
+                )
+            ] = data
 
 
     return result
@@ -1010,11 +1306,13 @@ def update_price_history(
 
     now = time.time()
 
+
     for key, data in market.items():
 
         if key not in price_history:
 
             price_history[key] = []
+
 
         price_history[key].append(
             (
@@ -1023,10 +1321,12 @@ def update_price_history(
             )
         )
 
+
         cutoff = (
             now
             - 3600
         )
+
 
         price_history[key] = [
             item
@@ -1035,7 +1335,11 @@ def update_price_history(
         ]
 
 
-def get_change(
+# ============================================================
+# HISTORICAL CHANGE
+# ============================================================
+
+def historical_change(
     symbol,
     exchange,
     seconds
@@ -1051,18 +1355,20 @@ def get_change(
         []
     )
 
+
     if len(history) < 2:
 
         return 0.0
 
+
+    now = time.time()
+
+    target = now - seconds
+
     current = history[-1][1]
 
-    target = (
-        time.time()
-        - seconds
-    )
-
     old = history[0][1]
+
 
     for timestamp, price in history:
 
@@ -1070,44 +1376,56 @@ def get_change(
 
             old = price
 
+
     if old <= 0:
-        return 0.0
+
+        return 0
+
 
     return (
         current - old
     ) / old * 100
 
 
-def get_volatility(
+# ============================================================
+# VOLATILITY
+# ============================================================
+
+def volatility(
     symbol,
     exchange
 ):
 
-    key = (
-        symbol,
-        exchange
-    )
-
     history = price_history.get(
-        key,
+        (
+            symbol,
+            exchange
+        ),
         []
     )
 
+
     if len(history) < 5:
-        return 0.0
+
+        return 0
+
 
     prices = [
         x[1]
         for x in history[-30:]
     ]
 
+
     avg = (
         sum(prices)
         / len(prices)
     )
 
+
     if avg <= 0:
-        return 0.0
+
+        return 0
+
 
     variance = sum(
         (
@@ -1116,37 +1434,156 @@ def get_volatility(
         for p in prices
     ) / len(prices)
 
+
     return (
-        math.sqrt(variance)
+        math.sqrt(
+            variance
+        )
         / avg
         * 100
     )
 
 
 # ============================================================
-# SCORING ENGINE
+# RSI
 # ============================================================
 
-def calculate_score(
+def calculate_rsi(
+    symbol,
+    exchange
+):
+
+    history = price_history.get(
+        (
+            symbol,
+            exchange
+        ),
+        []
+    )
+
+
+    if len(history) < 8:
+
+        return 50
+
+
+    prices = [
+        x[1]
+        for x in history[-30:]
+    ]
+
+
+    gains = []
+
+    losses = []
+
+
+    for i in range(
+        1,
+        len(prices)
+    ):
+
+        diff = (
+            prices[i]
+            - prices[i - 1]
+        )
+
+
+        if diff >= 0:
+
+            gains.append(
+                diff
+            )
+
+            losses.append(0)
+
+        else:
+
+            gains.append(0)
+
+            losses.append(
+                abs(diff)
+            )
+
+
+    if not gains:
+
+        return 50
+
+
+    avg_gain = (
+        sum(gains[-14:])
+        / min(
+            len(gains),
+            14
+        )
+    )
+
+
+    avg_loss = (
+        sum(losses[-14:])
+        / min(
+            len(losses),
+            14
+        )
+    )
+
+
+    if avg_loss == 0:
+
+        return 100
+
+
+    rs = (
+        avg_gain
+        / avg_loss
+    )
+
+
+    return (
+        100
+        - 100 / (
+            1 + rs
+        )
+    )
+
+
+# ============================================================
+# FEATURES
+# ============================================================
+
+def calculate_features(
     data
 ):
 
-    data.change_1m = get_change(
+    data.change_1m = historical_change(
         data.symbol,
         data.exchange,
         60
     )
 
-    data.change_5m = get_change(
+    data.change_5m = historical_change(
         data.symbol,
         data.exchange,
         300
     )
 
-    data.volatility = get_volatility(
+    data.change_15m = historical_change(
+        data.symbol,
+        data.exchange,
+        900
+    )
+
+    data.volatility = volatility(
         data.symbol,
         data.exchange
     )
+
+    data.rsi = calculate_rsi(
+        data.symbol,
+        data.exchange
+    )
+
 
     if data.ask > 0:
 
@@ -1155,59 +1592,78 @@ def calculate_score(
             - data.bid
         ) / data.ask * 100
 
+
+    data.momentum = (
+        data.change_1m
+        * 0.5
+        +
+        data.change_5m
+        * 0.3
+        +
+        data.change_15m
+        * 0.2
+    )
+
+
+    # ========================================================
+    # BASE SCORE
+    # ========================================================
+
     score = 50.0
 
 
-    # ========================================================
-    # MOMENTUM
-    # ========================================================
+    # Momentum
 
-    if data.change_1m > 0:
+    if data.momentum > 0:
 
         score += min(
-            data.change_1m * 5,
-            12
-        )
-
-    else:
-
-        score += max(
-            data.change_1m * 3,
-            -12
-        )
-
-
-    if data.change_5m > 0:
-
-        score += min(
-            data.change_5m * 3,
+            data.momentum * 5,
             15
         )
 
     else:
 
         score += max(
-            data.change_5m * 2,
+            data.momentum * 4,
             -15
         )
 
 
-    # ========================================================
-    # VOLATILITY
-    # ========================================================
+    # RSI
 
-    if 0.10 <= data.volatility <= 2.5:
+    if 45 <= data.rsi <= 65:
 
         score += 5
 
-    elif data.volatility > 5:
+    elif 30 <= data.rsi < 45:
+
+        score += 8
+
+    elif data.rsi > 75:
+
+        score -= 8
+
+    elif data.rsi < 20:
+
+        score -= 4
+
+
+    # Volatility
+
+    if (
+        0.1
+        <= data.volatility
+        <= 3
+    ):
+
+        score += 5
+
+    elif data.volatility > 6:
 
         score -= 10
 
 
-    # ========================================================
-    # SPREAD
-    # ========================================================
+    # Spread
 
     if data.spread < 0.15:
 
@@ -1218,47 +1674,7 @@ def calculate_score(
         score -= 5
 
 
-    # ========================================================
-    # LEARNING
-    # ========================================================
-
-    score += learning.score_adjustment
-
-
-    # ========================================================
-    # GOOD/BAD PATTERN MEMORY
-    # ========================================================
-
-    pattern = db_get_pattern_stats()
-
-    if pattern:
-
-        avg_win_score = (
-            pattern["avg_win_score"]
-        )
-
-        avg_loss_score = (
-            pattern["avg_loss_score"]
-        )
-
-        if avg_win_score:
-
-            if (
-                data.score >= avg_win_score
-            ):
-
-                score += 2
-
-        if avg_loss_score:
-
-            if (
-                data.score <= avg_loss_score
-            ):
-
-                score -= 2
-
-
-    score = max(
+    data.base_score = max(
         0,
         min(
             100,
@@ -1266,16 +1682,112 @@ def calculate_score(
         )
     )
 
-    data.score = score
 
-    return score
+    features = {
+        "change_1m":
+            data.change_1m,
+
+        "change_5m":
+            data.change_5m,
+
+        "change_15m":
+            data.change_15m,
+
+        "volatility":
+            data.volatility,
+
+        "spread":
+            data.spread,
+
+        "momentum":
+            data.momentum,
+
+        "rsi":
+            data.rsi,
+
+        "base_score":
+            data.base_score,
+
+        "hour_sin":
+            math.sin(
+                datetime.now().hour
+                / 24
+                * 2
+                * math.pi
+            ),
+
+        "hour_cos":
+            math.cos(
+                datetime.now().hour
+                / 24
+                * 2
+                * math.pi
+            )
+    }
+
+
+    return features
+
+
+# ============================================================
+# FINAL SCORE
+# ============================================================
+
+def calculate_final_score(
+    data
+):
+
+    features = calculate_features(
+        data
+    )
+
+
+    ml_probability = (
+        learning.predict_probability(
+            features
+        )
+    )
+
+
+    data.ml_probability = (
+        ml_probability
+    )
+
+
+    # До обучения ML не должен
+    # блокировать торговлю.
+
+    if learning.ready:
+
+        ml_bonus = (
+            ml_probability
+            - 0.5
+        ) * 30
+
+        data.final_score = max(
+            0,
+            min(
+                100,
+                data.base_score
+                + ml_bonus
+            )
+        )
+
+    else:
+
+        data.final_score = (
+            data.base_score
+        )
+
+
+    return features
 
 
 # ============================================================
 # BEST MARKET
 # ============================================================
 
-def best_market(
+def get_best_asset(
     symbol
 ):
 
@@ -1284,26 +1796,41 @@ def best_market(
         for (
             s,
             exchange
-        ), data in latest_market.items()
+        ), data
+        in latest_market.items()
         if s == symbol
     ]
 
+
     if not candidates:
 
-        return None
+        return None, None
+
+
+    best = None
+
+    best_features = None
+
 
     for data in candidates:
 
-        calculate_score(
+        features = calculate_final_score(
             data
         )
 
-    candidates.sort(
-        key=lambda x: x.score,
-        reverse=True
-    )
 
-    return candidates[0]
+        if (
+            best is None
+            or data.final_score
+            > best.final_score
+        ):
+
+            best = data
+
+            best_features = features
+
+
+    return best, best_features
 
 
 # ============================================================
@@ -1314,17 +1841,22 @@ def calculate_trade_size(
     score
 ):
 
-    available = wallet.usdt
+    available = wallet_usdt
+
 
     if available < MIN_TRADE_USDT:
 
         return 0
 
+
     confidence = (
-        score - BUY_SCORE
+        score
+        - MIN_TRADE_SCORE
     ) / (
-        100 - BUY_SCORE
+        100
+        - MIN_TRADE_SCORE
     )
+
 
     confidence = max(
         0,
@@ -1334,13 +1866,17 @@ def calculate_trade_size(
         )
     )
 
+
     percent = (
         8
-        + confidence
+        +
+        confidence
         * (
-            MAX_TRADE_PERCENT - 8
+            MAX_TRADE_PERCENT
+            - 8
         )
     )
+
 
     amount = (
         available
@@ -1348,10 +1884,12 @@ def calculate_trade_size(
         / 100
     )
 
+
     amount = max(
         amount,
         MIN_TRADE_USDT
     )
+
 
     amount = min(
         amount,
@@ -1360,82 +1898,27 @@ def calculate_trade_size(
         / 100
     )
 
+
     return amount
 
 
 # ============================================================
-# BUY DECISION
+# WALLET STATE
 # ============================================================
 
-def should_buy(
-    data
-):
+wallet_state = load_wallet_state()
 
-    if not data:
-        return False
+wallet_usdt = wallet_state["usdt"]
 
-    if data.symbol in wallet.positions:
-        return False
+wallet_realized_profit = (
+    wallet_state["realized_profit"]
+)
 
-    if wallet.usdt < MIN_TRADE_USDT:
-        return False
+wallet_total_fees = (
+    wallet_state["total_fees"]
+)
 
-    return data.score >= BUY_SCORE
-
-
-# ============================================================
-# SELL DECISION
-# ============================================================
-
-def should_sell(
-    position,
-    data
-):
-
-    if not data:
-
-        return False, "Нет данных"
-
-    pnl = (
-        data.price
-        - position.entry_price
-    ) / position.entry_price * 100
-
-    hold_minutes = (
-        time.time()
-        - position.opened_at
-    ) / 60
-
-
-    # TAKE PROFIT
-
-    if pnl >= TAKE_PROFIT_PERCENT:
-
-        return True, "TAKE PROFIT"
-
-
-    # STOP LOSS
-
-    if pnl <= -STOP_LOSS_PERCENT:
-
-        return True, "STOP LOSS"
-
-
-    # SCORE
-
-    if data.score <= SELL_SCORE:
-
-        return True, "Сигнал ослаб"
-
-
-    # TIMEOUT
-
-    if hold_minutes >= MAX_HOLD_MINUTES:
-
-        return True, "Максимальное время"
-
-
-    return False, ""
+positions = load_positions()
 
 
 # ============================================================
@@ -1444,47 +1927,112 @@ def should_sell(
 
 async def buy_asset(
     data,
-    amount
+    features,
+    amount_usdt
 ):
 
-    success = wallet.buy(
-        symbol=data.symbol,
-        exchange=data.exchange,
-        amount_usdt=amount,
-        price=data.ask,
-        score=data.score
-    )
+    global wallet_usdt
 
-    if not success:
+
+    if data.symbol in positions:
 
         return False
 
 
-    position = wallet.positions[
+    if amount_usdt <= 0:
+
+        return False
+
+
+    if amount_usdt > wallet_usdt:
+
+        return False
+
+
+    fee = (
+        amount_usdt
+        * FEE_PERCENT
+        / 100
+    )
+
+
+    total = (
+        amount_usdt
+        + fee
+    )
+
+
+    if total > wallet_usdt:
+
+        return False
+
+
+    amount_crypto = (
+        amount_usdt
+        / data.ask
+    )
+
+
+    wallet_usdt -= total
+
+
+    global wallet_total_fees
+
+    wallet_total_fees += fee
+
+
+    save_wallet_state(
+        wallet_usdt,
+        wallet_realized_profit,
+        wallet_total_fees
+    )
+
+
+    position = Position(
+        symbol=data.symbol,
+        exchange=data.exchange,
+        amount=amount_crypto,
+        entry_price=data.ask,
+        invested=amount_usdt,
+        opened_at=time.time(),
+        entry_score=data.final_score,
+        ml_probability=data.ml_probability,
+        features=features
+    )
+
+
+    positions[
         data.symbol
-    ]
+    ] = position
+
+
+    save_position(
+        position
+    )
 
 
     text = (
-        "🟢 <b>ПОКУПКА</b>\n\n"
+        "🟢 <b>БОТ КУПИЛ КРИПТОВАЛЮТУ</b>\n\n"
 
-        f"🪙 Актив: "
-        f"<b>{data.symbol}</b>\n"
+        f"🪙 <b>{data.symbol}</b>\n"
 
         f"🏦 Биржа: "
         f"<b>{data.exchange}</b>\n"
 
         f"💵 Сумма: "
-        f"<b>${amount:.2f}</b>\n"
+        f"<b>${amount_usdt:.2f}</b>\n"
 
         f"📦 Количество: "
-        f"<code>{position.amount:.10f}</code>\n"
+        f"<code>{amount_crypto:.10f}</code>\n"
 
         f"💰 Цена: "
-        f"<b>{format_price(data.ask)}</b>\n"
+        f"<b>{format_price(data.ask)}</b>\n\n"
 
         f"🧠 Score: "
-        f"<b>{data.score:.2f}/100</b>\n"
+        f"<b>{data.final_score:.2f}/100</b>\n"
+
+        f"🤖 ML вероятность: "
+        f"<b>{data.ml_probability * 100:.1f}%</b>\n"
 
         f"📈 1m: "
         f"<b>{data.change_1m:+.3f}%</b>\n"
@@ -1492,21 +2040,28 @@ async def buy_asset(
         f"📈 5m: "
         f"<b>{data.change_5m:+.3f}%</b>\n"
 
+        f"📈 15m: "
+        f"<b>{data.change_15m:+.3f}%</b>\n"
+
+        f"📊 RSI: "
+        f"<b>{data.rsi:.1f}</b>\n"
+
         f"📊 Volatility: "
         f"<b>{data.volatility:.3f}%</b>\n\n"
 
         f"👛 USDT осталось: "
-        f"<b>${wallet.usdt:.2f}</b>\n\n"
+        f"<b>${wallet_usdt:.2f}</b>\n\n"
 
         f"⏰ {now_string()}\n"
 
-        "🟡 PAPER"
+        "🟡 PAPER MODE"
     )
 
 
     await send_event(
         text
     )
+
 
     return True
 
@@ -1520,19 +2075,45 @@ async def sell_asset(
     reason
 ):
 
-    result = wallet.sell(
-        data.symbol,
-        data.bid
+    global wallet_usdt
+    global wallet_realized_profit
+    global wallet_total_fees
+
+
+    position = positions.get(
+        data.symbol
     )
 
-    if not result:
+
+    if not position:
 
         return False
 
 
-    position = result["position"]
+    gross = (
+        position.amount
+        * data.bid
+    )
 
-    profit = result["profit"]
+
+    fee = (
+        gross
+        * FEE_PERCENT
+        / 100
+    )
+
+
+    received = (
+        gross
+        - fee
+    )
+
+
+    profit = (
+        received
+        - position.invested
+    )
+
 
     profit_percent = (
         profit
@@ -1541,22 +2122,42 @@ async def sell_asset(
     )
 
 
-    db_save_trade(
+    wallet_usdt += received
+
+    wallet_realized_profit += profit
+
+    wallet_total_fees += fee
+
+
+    save_wallet_state(
+        wallet_usdt,
+        wallet_realized_profit,
+        wallet_total_fees
+    )
+
+
+    save_trade(
         position=position,
         exit_price=data.bid,
         profit=profit,
         profit_percent=profit_percent,
         reason=reason,
-        exit_score=data.score
+        exit_score=data.final_score
     )
 
 
-    learning.learn(
-        profit=profit,
-        entry_score=position.entry_score,
-        change_1m=data.change_1m,
-        change_5m=data.change_5m,
-        volatility=data.volatility
+    delete_position(
+        data.symbol
+    )
+
+
+    del positions[
+        data.symbol
+    ]
+
+
+    learning.record_result(
+        profit
     )
 
 
@@ -1568,41 +2169,43 @@ async def sell_asset(
 
 
     text = (
-        f"{emoji} <b>ПРОДАЖА</b>\n\n"
+        f"{emoji} <b>БОТ ПРОДАЛ КРИПТОВАЛЮТУ</b>\n\n"
 
-        f"🪙 Актив: "
-        f"<b>{data.symbol}</b>\n"
+        f"🪙 <b>{data.symbol}</b>\n"
 
         f"🏦 Биржа: "
-        f"<b>{position.exchange}</b>\n"
+        f"<b>{position.exchange}</b>\n\n"
 
         f"💰 Покупка: "
         f"<b>{format_price(position.entry_price)}</b>\n"
 
         f"💵 Продажа: "
-        f"<b>{format_price(data.bid)}</b>\n"
+        f"<b>{format_price(data.bid)}</b>\n\n"
 
         f"📦 Количество: "
         f"<code>{position.amount:.10f}</code>\n"
 
         f"💸 Результат: "
-        f"<b>{profit:+.2f}$ "
-        f"({profit_percent:+.2f}%)</b>\n"
+        f"<b>{profit:+.2f}$</b>\n"
+
+        f"📊 ROI сделки: "
+        f"<b>{profit_percent:+.2f}%</b>\n\n"
 
         f"📌 Причина: "
         f"<b>{reason}</b>\n\n"
 
         f"👛 Баланс: "
-        f"<b>${wallet.usdt:.2f}</b>\n\n"
+        f"<b>${wallet_usdt:.2f}</b>\n"
 
-        f"🧠 Память обновлена\n"
+        f"🧠 Сделок в памяти: "
+        f"<b>{learning.total_trades}</b>\n"
 
-        f"🧠 Коррекция стратегии: "
-        f"<b>{learning.score_adjustment:+.2f}</b>\n\n"
+        f"🎯 Winrate: "
+        f"<b>{learning.winrate:.1f}%</b>\n\n"
 
         f"⏰ {now_string()}\n"
 
-        "🟡 PAPER"
+        "🟡 PAPER MODE"
     )
 
 
@@ -1610,81 +2213,310 @@ async def sell_asset(
         text
     )
 
+
     return True
 
 
 # ============================================================
-# EVENT MESSAGES
+# SELL DECISION
 # ============================================================
 
-async def send_event(
-    text
+def should_sell(
+    position,
+    data
 ):
 
-    for chat_id in list(
-        dashboard_messages.keys()
+    current_price = data.price
+
+
+    pnl = (
+        current_price
+        - position.entry_price
+    ) / position.entry_price * 100
+
+
+    holding_minutes = (
+        time.time()
+        - position.opened_at
+    ) / 60
+
+
+    # Take profit
+
+    if pnl >= TAKE_PROFIT_PERCENT:
+
+        return True, "TAKE PROFIT"
+
+
+    # Stop loss
+
+    if pnl <= -STOP_LOSS_PERCENT:
+
+        return True, "STOP LOSS"
+
+
+    # ML сильно изменился
+
+    if (
+        learning.ready
+        and data.ml_probability < 0.35
+        and pnl > 0
     ):
+
+        return True, "ML SIGNAL WEAKENED"
+
+
+    # Общий score
+
+    if data.final_score < 40:
+
+        return True, "MARKET SCORE DROPPED"
+
+
+    # Максимальное время
+
+    if holding_minutes >= MAX_HOLD_MINUTES:
+
+        return True, "MAX HOLD TIME"
+
+
+    return False, ""
+
+
+# ============================================================
+# AUTO TRADING
+# ============================================================
+
+async def trading_loop(
+    chat_id
+):
+
+    global auto_running
+
+
+    while auto_running:
 
         try:
 
-            await bot.send_message(
-                chat_id,
-                text
+            await update_market()
+
+
+            # =================================================
+            # SELL
+            # =================================================
+
+            for symbol in list(
+                positions.keys()
+            ):
+
+                position = positions.get(
+                    symbol
+                )
+
+                if not position:
+                    continue
+
+
+                data, features = get_best_asset(
+                    symbol
+                )
+
+
+                if not data:
+                    continue
+
+
+                sell, reason = should_sell(
+                    position,
+                    data
+                )
+
+
+                if sell:
+
+                    await sell_asset(
+                        data,
+                        reason
+                    )
+
+
+            # =================================================
+            # BUY
+            # =================================================
+
+            candidates = []
+
+
+            for symbol in SYMBOLS:
+
+                if symbol in positions:
+
+                    continue
+
+
+                data, features = get_best_asset(
+                    symbol
+                )
+
+
+                if not data:
+
+                    continue
+
+
+                if data.final_score < MIN_TRADE_SCORE:
+
+                    continue
+
+
+                if (
+                    learning.ready
+                    and
+                    data.ml_probability
+                    < MIN_ML_PROBABILITY
+                ):
+
+                    continue
+
+
+                candidates.append(
+                    (
+                        data,
+                        features
+                    )
+                )
+
+
+            if candidates:
+
+                candidates.sort(
+                    key=lambda x: (
+                        x[0].final_score
+                    ),
+                    reverse=True
+                )
+
+
+                best, features = candidates[0]
+
+
+                amount = calculate_trade_size(
+                    best.final_score
+                )
+
+
+                if amount >= MIN_TRADE_USDT:
+
+                    await buy_asset(
+                        best,
+                        features,
+                        amount
+                    )
+
+
+            await show_dashboard(
+                chat_id
             )
+
+
+        except asyncio.CancelledError:
+
+            raise
+
 
         except Exception as e:
 
             print(
-                "Telegram error:",
+                "[TRADING ERROR]",
                 e
             )
 
 
+        await asyncio.sleep(
+            SCAN_INTERVAL
+        )
+
+
 # ============================================================
-# FORMAT
+# UPDATE MARKET
 # ============================================================
 
-def format_price(
-    value
-):
+async def update_market():
 
-    if value >= 1000:
-
-        return f"${value:,.2f}"
-
-    if value >= 1:
-
-        return f"${value:,.4f}"
-
-    return f"${value:.8f}"
+    global latest_market
+    global market_updates
 
 
-def now_string():
+    market = await fetch_market()
 
-    return datetime.now().strftime(
-        "%H:%M:%S"
+
+    if not market:
+
+        return False
+
+
+    latest_market = market
+
+
+    update_price_history(
+        market
     )
+
+
+    for data in latest_market.values():
+
+        calculate_final_score(
+            data
+        )
+
+
+    market_updates += 1
+
+
+    return True
 
 
 # ============================================================
 # DASHBOARD
 # ============================================================
 
+def portfolio_value():
+
+    value = wallet_usdt
+
+
+    for symbol, position in positions.items():
+
+        candidates = [
+            data
+            for (
+                s,
+                exchange
+            ), data
+            in latest_market.items()
+            if s == symbol
+        ]
+
+
+        if candidates:
+
+            price = max(
+                candidates,
+                key=lambda x: x.price
+            ).price
+
+            value += (
+                position.amount
+                * price
+            )
+
+
+    return value
+
+
 def dashboard_text():
 
-    prices = {}
-
-    for (
-        symbol,
-        exchange
-    ), data in latest_market.items():
-
-        prices[symbol] = data.price
-
-
-    equity = wallet.equity(
-        prices
-    )
+    equity = portfolio_value()
 
 
     pnl = (
@@ -1701,10 +2533,10 @@ def dashboard_text():
 
 
     text = (
-        "🤖 <b>AUTONOMOUS PAPER TRADER</b>\n\n"
+        "🤖 <b>AUTONOMOUS CRYPTO TRADER</b>\n\n"
 
         f"💵 USDT: "
-        f"<b>${wallet.usdt:.2f}</b>\n"
+        f"<b>${wallet_usdt:.2f}</b>\n"
 
         f"👛 Портфель: "
         f"<b>${equity:.2f}</b>\n"
@@ -1713,13 +2545,13 @@ def dashboard_text():
         f"<b>{pnl:+.2f}$ "
         f"({roi:+.2f}%)</b>\n\n"
 
-        f"🪙 Активов: "
+        f"🪙 Монет: "
         f"<b>{len(SYMBOLS)}</b>\n"
 
-        f"🏦 Бирж подключено: "
+        f"🏦 Бирж активно: "
         f"<b>{len(exchanges)}</b>\n"
 
-        f"📡 Рыночных данных: "
+        f"📡 Данных: "
         f"<b>{len(latest_market)}</b>\n"
 
         f"🔄 Обновлений: "
@@ -1728,26 +2560,23 @@ def dashboard_text():
         f"📊 Сделок: "
         f"<b>{learning.total_trades}</b>\n"
 
-        f"🟢 Winrate: "
+        f"🎯 Winrate: "
         f"<b>{learning.winrate:.1f}%</b>\n"
 
-        f"💰 Общая прибыль: "
+        f"💰 Реализовано: "
         f"<b>{learning.total_profit:+.2f}$</b>\n\n"
 
-        f"🧠 Коррекция: "
-        f"<b>{learning.score_adjustment:+.2f}</b>\n"
+        f"🧠 ML модель: "
+        f"<b>{'🟢 ACTIVE' if learning.ready else '🟡 Сбор данных'}</b>\n"
 
-        f"🧠 Хороших паттернов: "
-        f"<b>{learning.good_patterns}</b>\n"
-
-        f"🧠 Плохих паттернов: "
-        f"<b>{learning.bad_patterns}</b>\n\n"
+        f"🧠 Обновлений модели: "
+        f"<b>{learning.model_updates}</b>\n\n"
 
         f"⚙️ Автотрейдинг: "
         f"<b>{'🟢 ON' if auto_running else '🔴 OFF'}</b>\n\n"
 
         "🟡 <b>PAPER MODE</b>\n"
-        "Реальные деньги и ордера отключены."
+        "Реальные ордера отключены."
     )
 
 
@@ -1759,6 +2588,7 @@ def keyboard():
 
     builder = InlineKeyboardBuilder()
 
+
     buttons = [
         ("▶️ Запустить", "start"),
         ("⏹ Остановить", "stop"),
@@ -1766,11 +2596,12 @@ def keyboard():
         ("👛 Кошелёк", "wallet"),
         ("📊 Рынок", "market"),
 
-        ("📜 История", "history"),
+        ("📜 Сделки", "history"),
         ("🧠 Обучение", "learning"),
 
         ("🔄 Обновить", "refresh"),
     ]
+
 
     for text, callback in buttons:
 
@@ -1779,7 +2610,9 @@ def keyboard():
             callback_data=callback
         )
 
+
     builder.adjust(2)
+
 
     return builder.as_markup()
 
@@ -1811,9 +2644,11 @@ async def show_dashboard(
             reply_markup=keyboard()
         )
 
+
         dashboard_messages[
             chat_id
         ] = message.message_id
+
 
         return
 
@@ -1827,16 +2662,44 @@ async def show_dashboard(
             reply_markup=keyboard()
         )
 
+
     except Exception as e:
 
         print(
-            "Dashboard edit:",
+            "[DASHBOARD EDIT]",
             e
         )
 
 
 # ============================================================
-# /START
+# TELEGRAM EVENTS
+# ============================================================
+
+async def send_event(
+    text
+):
+
+    for chat_id in list(
+        dashboard_messages.keys()
+    ):
+
+        try:
+
+            await bot.send_message(
+                chat_id,
+                text
+            )
+
+        except Exception as e:
+
+            print(
+                "[TELEGRAM EVENT]",
+                e
+            )
+
+
+# ============================================================
+# START
 # ============================================================
 
 @dp.message(
@@ -1851,7 +2714,9 @@ async def start_command(
         await message.delete()
 
     except Exception:
+
         pass
+
 
     await show_dashboard(
         message.chat.id
@@ -1873,7 +2738,9 @@ async def refresh(
         "Обновляю рынок..."
     )
 
+
     await update_market()
+
 
     await show_dashboard(
         callback.message.chat.id
@@ -1881,52 +2748,89 @@ async def refresh(
 
 
 # ============================================================
-# MARKET
+# START AUTO
 # ============================================================
 
-def market_text():
-
-    lines = [
-        "📊 <b>РЫНОК</b>",
-        ""
-    ]
-
-    for symbol in SYMBOLS:
-
-        data = best_market(
-            symbol
-        )
-
-        if not data:
-            continue
-
-        lines.append(
-            f"🪙 <b>{symbol}</b>\n"
-            f"🏦 {data.exchange}\n"
-            f"💰 {format_price(data.price)}\n"
-            f"🧠 Score: "
-            f"<b>{data.score:.1f}</b>\n"
-            f"📈 1m: "
-            f"{data.change_1m:+.3f}% | "
-            f"5m: "
-            f"{data.change_5m:+.3f}%\n"
-        )
-
-    return "\n".join(lines)
-
-
 @dp.callback_query(
-    F.data == "market"
+    F.data == "start"
 )
-async def market(
+async def start_auto(
     callback: CallbackQuery
 ):
 
+    global auto_running
+    global auto_task
+
+
     await callback.answer()
+
+
+    if auto_running:
+
+        await show_dashboard(
+            callback.message.chat.id,
+            "🟢 <b>БОТ УЖЕ РАБОТАЕТ</b>\n\n"
+            + dashboard_text()
+        )
+
+        return
+
+
+    auto_running = True
+
 
     await show_dashboard(
         callback.message.chat.id,
-        market_text()
+        "🟢 <b>АВТОТРЕЙДИНГ ЗАПУЩЕН</b>\n\n"
+        "Начинаю анализ 50 активов."
+    )
+
+
+    auto_task = asyncio.create_task(
+        trading_loop(
+            callback.message.chat.id
+        )
+    )
+
+
+# ============================================================
+# STOP AUTO
+# ============================================================
+
+@dp.callback_query(
+    F.data == "stop"
+)
+async def stop_auto(
+    callback: CallbackQuery
+):
+
+    global auto_running
+    global auto_task
+
+
+    await callback.answer()
+
+
+    auto_running = False
+
+
+    if auto_task:
+
+        auto_task.cancel()
+
+        try:
+
+            await auto_task
+
+        except asyncio.CancelledError:
+
+            pass
+
+        auto_task = None
+
+
+    await show_dashboard(
+        callback.message.chat.id
     )
 
 
@@ -1943,33 +2847,17 @@ async def wallet_callback(
 
     await callback.answer()
 
-    prices = {}
-
-    for (
-        symbol,
-        exchange
-    ), data in latest_market.items():
-
-        prices[symbol] = data.price
-
-
-    equity = wallet.equity(
-        prices
-    )
-
 
     lines = [
         "👛 <b>ВИРТУАЛЬНЫЙ КОШЕЛЁК</b>",
         "",
         f"💵 USDT: "
-        f"<b>${wallet.usdt:.2f}</b>",
-        f"💰 Общая стоимость: "
-        f"<b>${equity:.2f}</b>",
+        f"<b>${wallet_usdt:.2f}</b>",
         ""
     ]
 
 
-    if not wallet.positions:
+    if not positions:
 
         lines.append(
             "📭 Открытых позиций нет."
@@ -1977,22 +2865,44 @@ async def wallet_callback(
 
     else:
 
-        for symbol, position in wallet.positions.items():
+        for symbol, position in positions.items():
 
-            current = prices.get(
-                symbol,
-                position.entry_price
-            )
+            candidates = [
+                data
+                for (
+                    s,
+                    exchange
+                ), data
+                in latest_market.items()
+                if s == symbol
+            ]
+
+
+            if candidates:
+
+                current = max(
+                    candidates,
+                    key=lambda x: x.price
+                ).price
+
+            else:
+
+                current = (
+                    position.entry_price
+                )
+
 
             value = (
                 position.amount
                 * current
             )
 
+
             pnl = (
                 value
                 - position.invested
             )
+
 
             pnl_percent = (
                 pnl
@@ -2000,11 +2910,13 @@ async def wallet_callback(
                 * 100
             )
 
+
             emoji = (
                 "🟢"
                 if pnl >= 0
                 else "🔴"
             )
+
 
             lines.append(
                 f"{emoji} <b>{symbol}</b>\n"
@@ -2012,12 +2924,67 @@ async def wallet_callback(
                 f"📦 {position.amount:.8f}\n"
                 f"💰 Entry: "
                 f"{format_price(position.entry_price)}\n"
-                f"📊 Сейчас: "
+                f"📊 Current: "
                 f"{format_price(current)}\n"
                 f"P/L: "
                 f"<b>{pnl:+.2f}$ "
                 f"({pnl_percent:+.2f}%)</b>\n"
+                f"🧠 Entry score: "
+                f"{position.entry_score:.1f}\n"
             )
+
+
+    await show_dashboard(
+        callback.message.chat.id,
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# MARKET
+# ============================================================
+
+@dp.callback_query(
+    F.data == "market"
+)
+async def market(
+    callback: CallbackQuery
+):
+
+    await callback.answer()
+
+
+    lines = [
+        "📊 <b>РЫНОК</b>",
+        ""
+    ]
+
+
+    for symbol in SYMBOLS:
+
+        data, _ = get_best_asset(
+            symbol
+        )
+
+
+        if not data:
+
+            continue
+
+
+        lines.append(
+            f"🪙 <b>{symbol}</b>\n"
+            f"🏦 {data.exchange}\n"
+            f"💰 {format_price(data.price)}\n"
+            f"🧠 Score: "
+            f"<b>{data.final_score:.1f}</b>\n"
+            f"🤖 ML: "
+            f"<b>{data.ml_probability * 100:.1f}%</b>\n"
+            f"📈 1m: "
+            f"{data.change_1m:+.3f}% | "
+            f"5m: "
+            f"{data.change_5m:+.3f}%\n"
+        )
 
 
     await show_dashboard(
@@ -2039,9 +3006,8 @@ async def history(
 
     await callback.answer()
 
-    trades = db_get_recent_trades(
-        15
-    )
+
+    trades = get_trades()
 
 
     if not trades:
@@ -2051,6 +3017,7 @@ async def history(
             "Сделок пока нет."
         )
 
+
     else:
 
         lines = [
@@ -2058,24 +3025,29 @@ async def history(
             ""
         ]
 
+
         for trade in trades:
 
             emoji = (
                 "🟢"
-                if trade["result"] >= 0
+                if trade["profit"] >= 0
                 else "🔴"
             )
 
+
             lines.append(
-                f"{emoji} "
-                f"<b>{trade['symbol']}</b>\n"
+                f"{emoji} <b>{trade['symbol']}</b>\n"
                 f"🏦 {trade['exchange']}\n"
                 f"💰 "
-                f"{trade['result']:+.2f}$ "
-                f"({trade['result_percent']:+.2f}%)\n"
+                f"{trade['profit']:+.2f}$ "
+                f"({trade['profit_percent']:+.2f}%)\n"
                 f"📌 {trade['reason']}\n"
-                f"⏰ {trade['closed_at'][-8:]}\n"
+                f"🧠 Score: "
+                f"{trade['entry_score']:.1f}\n"
+                f"⏰ "
+                f"{datetime.fromtimestamp(trade['closed_at']).strftime('%H:%M:%S')}\n"
             )
+
 
         text = "\n".join(lines)
 
@@ -2099,26 +3071,6 @@ async def learning_callback(
 
     await callback.answer()
 
-    pattern = db_get_pattern_stats()
-
-
-    if pattern:
-
-        avg_win = (
-            pattern["avg_win_score"]
-            or 0
-        )
-
-        avg_loss = (
-            pattern["avg_loss_score"]
-            or 0
-        )
-
-    else:
-
-        avg_win = 0
-        avg_loss = 0
-
 
     text = (
         "🧠 <b>ПАМЯТЬ И ОБУЧЕНИЕ</b>\n\n"
@@ -2126,11 +3078,11 @@ async def learning_callback(
         f"📊 Сделок: "
         f"<b>{learning.total_trades}</b>\n"
 
-        f"🟢 Успешных: "
-        f"<b>{learning.winning_trades}</b>\n"
+        f"🟢 Побед: "
+        f"<b>{learning.wins}</b>\n"
 
-        f"🔴 Неудачных: "
-        f"<b>{learning.losing_trades}</b>\n"
+        f"🔴 Убытков: "
+        f"<b>{learning.losses}</b>\n"
 
         f"🎯 Winrate: "
         f"<b>{learning.winrate:.2f}%</b>\n\n"
@@ -2138,29 +3090,26 @@ async def learning_callback(
         f"💰 Результат: "
         f"<b>{learning.total_profit:+.2f}$</b>\n"
 
-        f"🏆 Лучшая сделка: "
+        f"🏆 Лучшая: "
         f"<b>{learning.best_trade:+.2f}$</b>\n"
 
-        f"💀 Худшая сделка: "
+        f"💀 Худшая: "
         f"<b>{learning.worst_trade:+.2f}$</b>\n\n"
 
-        f"🧠 Хороших паттернов: "
-        f"<b>{learning.good_patterns}</b>\n"
+        f"🤖 ML модель: "
+        f"<b>{'ACTIVE' if learning.ready else 'COLLECTING DATA'}</b>\n"
 
-        f"🧠 Плохих паттернов: "
-        f"<b>{learning.bad_patterns}</b>\n\n"
+        f"🧠 Переобучений: "
+        f"<b>{learning.model_updates}</b>\n\n"
 
-        f"📈 Средний score прибыльных: "
-        f"<b>{avg_win:.2f}</b>\n"
+        "Бот сохраняет признаки ситуации "
+        "при покупке и результат после продажи.\n\n"
 
-        f"📉 Средний score убыточных: "
-        f"<b>{avg_loss:.2f}</b>\n\n"
+        "🟢 Удачная сделка → модель получает "
+        "пример хорошей ситуации.\n"
 
-        f"⚙️ Коррекция стратегии: "
-        f"<b>{learning.score_adjustment:+.2f}</b>\n\n"
-
-        "💾 Память хранится в SQLite.\n"
-        "После перезапуска история не исчезает."
+        "🔴 Неудачная сделка → модель получает "
+        "пример плохой ситуации."
     )
 
 
@@ -2168,266 +3117,6 @@ async def learning_callback(
         callback.message.chat.id,
         text
     )
-
-
-# ============================================================
-# AUTO START
-# ============================================================
-
-@dp.callback_query(
-    F.data == "start"
-)
-async def start_auto(
-    callback: CallbackQuery
-):
-
-    global auto_running
-    global auto_task
-
-    await callback.answer()
-
-    if auto_running:
-
-        await show_dashboard(
-            callback.message.chat.id,
-            "🟢 <b>БОТ УЖЕ РАБОТАЕТ</b>\n\n"
-            "Автотрейдинг уже запущен."
-        )
-
-        return
-
-
-    auto_running = True
-
-
-    await show_dashboard(
-        callback.message.chat.id,
-        "🟢 <b>АВТОТРЕЙДИНГ ЗАПУЩЕН</b>\n\n"
-        "Бот начинает анализировать рынок."
-    )
-
-
-    auto_task = asyncio.create_task(
-        trading_loop(
-            callback.message.chat.id
-        )
-    )
-
-
-# ============================================================
-# AUTO STOP
-# ============================================================
-
-@dp.callback_query(
-    F.data == "stop"
-)
-async def stop_auto(
-    callback: CallbackQuery
-):
-
-    global auto_running
-    global auto_task
-
-    await callback.answer()
-
-    auto_running = False
-
-
-    if auto_task:
-
-        auto_task.cancel()
-
-        try:
-
-            await auto_task
-
-        except asyncio.CancelledError:
-
-            pass
-
-        auto_task = None
-
-
-    await show_dashboard(
-        callback.message.chat.id,
-        "⏹ <b>АВТОТРЕЙДИНГ ОСТАНОВЛЕН</b>\n\n"
-        + dashboard_text()
-    )
-
-
-# ============================================================
-# UPDATE MARKET
-# ============================================================
-
-async def update_market():
-
-    global latest_market
-    global market_updates
-    global last_scan_time
-
-    market = await fetch_all_market()
-
-    if not market:
-
-        return False
-
-    latest_market = market
-
-    update_price_history(
-        market
-    )
-
-    for data in latest_market.values():
-
-        calculate_score(
-            data
-        )
-
-    market_updates += 1
-
-    last_scan_time = time.time()
-
-    return True
-
-
-# ============================================================
-# TRADING LOOP
-# ============================================================
-
-async def trading_loop(
-    chat_id
-):
-
-    global auto_running
-
-    while auto_running:
-
-        try:
-
-            success = await update_market()
-
-            if not success:
-
-                await asyncio.sleep(
-                    SCAN_INTERVAL
-                )
-
-                continue
-
-
-            # =================================================
-            # SELL EXISTING
-            # =================================================
-
-            positions_to_sell = []
-
-
-            for symbol, position in list(
-                wallet.positions.items()
-            ):
-
-                data = best_market(
-                    symbol
-                )
-
-                if not data:
-                    continue
-
-                sell, reason = should_sell(
-                    position,
-                    data
-                )
-
-                if sell:
-
-                    positions_to_sell.append(
-                        (
-                            data,
-                            reason
-                        )
-                    )
-
-
-            for data, reason in positions_to_sell:
-
-                await sell_asset(
-                    data,
-                    reason
-                )
-
-
-            # =================================================
-            # BUY NEW ASSET
-            # =================================================
-
-            candidates = []
-
-
-            for symbol in SYMBOLS:
-
-                if symbol in wallet.positions:
-
-                    continue
-
-                data = best_market(
-                    symbol
-                )
-
-                if not data:
-                    continue
-
-                if should_buy(data):
-
-                    candidates.append(
-                        data
-                    )
-
-
-            if candidates:
-
-                candidates.sort(
-                    key=lambda x: x.score,
-                    reverse=True
-                )
-
-                best = candidates[0]
-
-                amount = calculate_trade_size(
-                    best.score
-                )
-
-                if amount >= MIN_TRADE_USDT:
-
-                    await buy_asset(
-                        best,
-                        amount
-                    )
-
-
-            # =================================================
-            # DASHBOARD
-            # =================================================
-
-            await show_dashboard(
-                chat_id
-            )
-
-
-        except asyncio.CancelledError:
-
-            raise
-
-        except Exception as e:
-
-            print(
-                "TRADING LOOP ERROR:",
-                e
-            )
-
-
-        await asyncio.sleep(
-            SCAN_INTERVAL
-        )
 
 
 # ============================================================
@@ -2447,8 +3136,35 @@ async def fallback(
 
         pass
 
+
     await show_dashboard(
         message.chat.id
+    )
+
+
+# ============================================================
+# FORMATTING
+# ============================================================
+
+def format_price(
+    value
+):
+
+    if value >= 1000:
+
+        return f"${value:,.2f}"
+
+    if value >= 1:
+
+        return f"${value:,.4f}"
+
+    return f"${value:.8f}"
+
+
+def now_string():
+
+    return datetime.now().strftime(
+        "%H:%M:%S"
     )
 
 
@@ -2459,16 +3175,62 @@ async def fallback(
 async def main():
 
     global bot
+    global learning
+    global wallet_state
+    global wallet_usdt
+    global wallet_realized_profit
+    global wallet_total_fees
+    global positions
 
-    global auto_running
 
-    db_init()
+    # --------------------------------------------------------
+    # DATABASE MUST BE INITIALIZED FIRST
+    # --------------------------------------------------------
+
+    init_database()
+
+
+    # --------------------------------------------------------
+    # NOW LEARNING CAN BE CREATED
+    # --------------------------------------------------------
+
+    learning = LearningEngine()
+
+
+    # --------------------------------------------------------
+    # LOAD WALLET
+    # --------------------------------------------------------
+
+    wallet_state = load_wallet_state()
+
+    wallet_usdt = wallet_state[
+        "usdt"
+    ]
+
+    wallet_realized_profit = (
+        wallet_state[
+            "realized_profit"
+        ]
+    )
+
+    wallet_total_fees = (
+        wallet_state[
+            "total_fees"
+        ]
+    )
+
+
+    # --------------------------------------------------------
+    # LOAD POSITIONS
+    # --------------------------------------------------------
+
+    positions = load_positions()
 
 
     if not BOT_TOKEN:
 
         raise RuntimeError(
-            "BOT_TOKEN не найден."
+            "BOT_TOKEN отсутствует в .env"
         )
 
 
@@ -2483,42 +3245,64 @@ async def main():
     print("=" * 70)
 
     print(
-        "AUTONOMOUS PAPER TRADER"
+        "AUTONOMOUS CRYPTO PAPER TRADER"
+    )
+
+    print("=" * 70)
+
+    print(
+        "Starting balance:",
+        START_BALANCE
     )
 
     print(
-        f"Starting balance: ${START_BALANCE}"
+        "Current balance:",
+        wallet_usdt
     )
 
     print(
-        f"Assets: {len(SYMBOLS)}"
+        "Assets:",
+        len(SYMBOLS)
     )
 
     print(
-        f"Requested exchanges: {len(EXCHANGE_IDS)}"
+        "Requested exchanges:",
+        len(EXCHANGE_IDS)
     )
 
     print(
-        f"Scan interval: {SCAN_INTERVAL}s"
+        "Scan interval:",
+        SCAN_INTERVAL
     )
 
     print(
-        "LIVE TRADING: OFF"
+        "ML model:",
+        learning.ready
     )
 
     print(
-        f"Database: {DB_FILE}"
+        "Previous trades:",
+        learning.total_trades
+    )
+
+    print(
+        "LIVE TRADING:",
+        LIVE_TRADING
     )
 
     print("=" * 70)
 
 
-    await init_exchanges()
+    # --------------------------------------------------------
+    # EXCHANGES
+    # --------------------------------------------------------
+
+    await initialize_exchanges()
 
 
     print(
-        f"Active exchanges: "
-        f"{len(exchanges)}"
+        "Active exchanges:",
+        len(exchanges)
     )
 
 
@@ -2528,7 +3312,10 @@ async def main():
             bot
         )
 
+
     finally:
+
+        global auto_running
 
         auto_running = False
 
@@ -2551,11 +3338,14 @@ async def main():
 
         await bot.session.close()
 
-        db.close()
+
+        if db:
+
+            db.close()
 
 
 # ============================================================
-# START
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
