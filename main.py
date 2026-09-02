@@ -311,7 +311,6 @@ def init_database():
     global db
 
     if db is not None:
-
         return
 
     db = sqlite3.connect(
@@ -438,10 +437,6 @@ def init_database():
         )
     """)
 
-    # ========================================================
-    # MIGRATION LEARNING STATE
-    # ========================================================
-
     learning_columns = {
         row["name"]
         for row in cursor.execute(
@@ -456,10 +451,6 @@ def init_database():
             ADD COLUMN last_learning_time
             REAL NOT NULL DEFAULT 0
         """)
-
-    # ========================================================
-    # MIGRATION POSITIONS
-    # ========================================================
 
     position_columns = {
         row["name"]
@@ -924,6 +915,7 @@ class LearningEngine:
 
         self.load_models()
 
+
     @property
     def winrate(self):
 
@@ -938,6 +930,7 @@ class LearningEngine:
             *
             100
         )
+
 
     # ========================================================
     # FEATURES
@@ -1056,8 +1049,9 @@ class LearningEngine:
             )
         ]
 
+
     # ========================================================
-    # LOAD
+    # LOAD MODELS
     # ========================================================
 
     def load_models(self):
@@ -1101,6 +1095,7 @@ class LearningEngine:
 
             self.ready = False
 
+
         try:
 
             if (
@@ -1139,6 +1134,7 @@ class LearningEngine:
             self.return_scaler = None
 
             self.return_ready = False
+
 
     # ========================================================
     # LOAD ALL TRADES
@@ -1210,6 +1206,7 @@ class LearningEngine:
             returns
         )
 
+
     # ========================================================
     # FULL TRAIN
     # ========================================================
@@ -1229,8 +1226,7 @@ class LearningEngine:
         if len(X) < 10:
 
             print(
-                "[LEARNING] waiting for "
-                "more trades:",
+                "[LEARNING] waiting for more trades:",
                 len(X),
                 "/ 10"
             )
@@ -1259,8 +1255,7 @@ class LearningEngine:
         ) < 2:
 
             print(
-                "[LEARNING] need both "
-                "winning and losing trades"
+                "[LEARNING] need both winning and losing trades"
             )
 
             return False
@@ -1298,8 +1293,8 @@ class LearningEngine:
                 average=True
             )
 
-            # Более новые сделки имеют больший вес,
-            # но старые ошибки НЕ удаляются.
+            # Новые сделки получают больший вес,
+            # но старые ошибки остаются в истории.
             weights = np.linspace(
                 0.75,
                 3.0,
@@ -1323,6 +1318,7 @@ class LearningEngine:
             )
 
             self.ready = True
+
 
             # ==================================================
             # RETURN MODEL
@@ -1399,13 +1395,10 @@ class LearningEngine:
             print(
                 "[LEARNING] FULL RETRAIN:",
                 self.model_updates,
-
                 "samples:",
                 len(X),
-
                 "wins:",
                 int(sum(y)),
-
                 "losses:",
                 int(len(y) - sum(y))
             )
@@ -1420,6 +1413,7 @@ class LearningEngine:
             )
 
             return False
+
 
     # ========================================================
     # PREDICT WIN PROBABILITY
@@ -1478,6 +1472,7 @@ class LearningEngine:
 
         return 0.5
 
+
     # ========================================================
     # PREDICT EXPECTED RETURN
     # ========================================================
@@ -1530,6 +1525,7 @@ class LearningEngine:
             )
 
         return 0.0
+
 
     # ========================================================
     # RECORD RESULT
@@ -1586,7 +1582,8 @@ class LearningEngine:
             f"{profit:+.4f}$"
         )
 
-        # После КАЖДОЙ сделки учимся на всей истории.
+        # После каждой сделки модель заново
+        # изучает всю историю.
         self.train_all()
 
 
@@ -1631,19 +1628,12 @@ def symbol_is_eligible(
     blocked_fragments = (
 
         "UP/USDT",
-
         "DOWN/USDT",
-
         "BULL/USDT",
-
         "BEAR/USDT",
-
         "3L/USDT",
-
         "3S/USDT",
-
         "5L/USDT",
-
         "5S/USDT",
     )
 
@@ -1704,7 +1694,6 @@ def get_created_timestamp(
         info.get(
             "onboardDate"
         ),
-
     ]
 
     for value in candidates:
@@ -1857,7 +1846,6 @@ async def discover_dynamic_markets():
             ).append(
                 {
                     "exchange": exchange_id,
-
                     "market": market
                 }
             )
@@ -2155,7 +2143,6 @@ async def fetch_exchange_tickers(
 
                 continue
 
-            # Жёсткий фильтр ликвидности.
             if volume < MIN_24H_VOLUME_USDT:
 
                 continue
@@ -2641,7 +2628,6 @@ def calculate_features(
         )
     )
 
-    # Ликвидность.
     volume_log = math.log10(
         max(
             data.volume,
@@ -2663,10 +2649,6 @@ def calculate_features(
             15
         )
     )
-
-    # ========================================================
-    # BASE SCORE
-    # ========================================================
 
     score = 50.0
 
@@ -2694,7 +2676,6 @@ def calculate_features(
         )
     )
 
-    # RSI.
     if 42 <= data.rsi <= 68:
 
         score += 5
@@ -2715,7 +2696,6 @@ def calculate_features(
 
         score -= 3
 
-    # Volatility.
     if (
         0.10
         <= data.volatility
@@ -2737,7 +2717,6 @@ def calculate_features(
 
         score -= 10
 
-    # Spread.
     if data.spread < 0.10:
 
         score += 5
@@ -2769,8 +2748,6 @@ def calculate_features(
 
     market_age_years = 1.0
 
-    # Возраст будет минимум 1 год для допуска.
-    # Если есть timestamp — используем его.
     for entry in market_entries:
 
         created = get_created_timestamp(
@@ -2940,7 +2917,7 @@ def calculate_final_score(
 
 
 # ============================================================
-# BEST MARKET FOR SYMBOL
+# BEST MARKET
 # ============================================================
 
 def get_best_asset(
@@ -3150,10 +3127,6 @@ async def buy_asset(
 
         return False
 
-    # ========================================================
-    # ML FILTER
-    # ========================================================
-
     if (
         learning is not None
         and
@@ -3166,10 +3139,6 @@ async def buy_asset(
 
         return False
 
-    # ========================================================
-    # EXPECTED MOVEMENT
-    # ========================================================
-
     if (
         learning is not None
         and
@@ -3181,10 +3150,6 @@ async def buy_asset(
     ):
 
         return False
-
-    # ========================================================
-    # DON'T BUY DEAD COINS
-    # ========================================================
 
     movement = max(
 
@@ -3449,6 +3414,24 @@ async def sell_asset(
         "🔴"
     )
 
+    trades_count = (
+        learning.total_trades
+        if learning
+        else 0
+    )
+
+    winrate = (
+        learning.winrate
+        if learning
+        else 0
+    )
+
+    updates = (
+        learning.model_updates
+        if learning
+        else 0
+    )
+
     text = (
 
         f"{emoji} "
@@ -3487,13 +3470,13 @@ async def sell_asset(
         f"<b>${wallet_usdt:.2f}</b>\n\n"
 
         f"🧠 Сделок: "
-        f"<b>{learning.total_trades if learning else 0}</b>\n"
+        f"<b>{trades_count}</b>\n"
 
         f"🎯 Winrate: "
-        f"<b>{learning.winrate if learning else 0:.1f}%</b>\n"
+        f"<b>{winrate:.1f}%</b>\n"
 
         f"🧠 Переобучений: "
-        f"<b>{learning.model_updates if learning else 0}</b>\n\n"
+        f"<b>{updates}</b>\n\n"
 
         f"⏰ {now_string()}\n"
 
@@ -3538,25 +3521,13 @@ def should_sell(
 
     ) / 60
 
-    # ========================================================
-    # TAKE PROFIT
-    # ========================================================
-
     if pnl >= TAKE_PROFIT_PERCENT:
 
         return True, "TAKE PROFIT"
 
-    # ========================================================
-    # HARD STOP
-    # ========================================================
-
     if pnl <= -STOP_LOSS_PERCENT:
 
         return True, "STOP LOSS"
-
-    # ========================================================
-    # MODEL EXPECTS DEEPER LOSS
-    # ========================================================
 
     if (
 
@@ -3582,10 +3553,6 @@ def should_sell(
             "MODEL EXPECTS DEEPER LOSS"
         )
 
-    # ========================================================
-    # ML PROBABILITY COLLAPSE
-    # ========================================================
-
     if (
 
         learning is not None
@@ -3608,10 +3575,6 @@ def should_sell(
             "ML PROBABILITY COLLAPSED"
         )
 
-    # ========================================================
-    # SCORE COLLAPSE
-    # ========================================================
-
     if (
 
         data.final_score < 38
@@ -3625,10 +3588,6 @@ def should_sell(
             True,
             "MARKET SCORE COLLAPSED"
         )
-
-    # ========================================================
-    # PROFIT REVERSAL
-    # ========================================================
 
     if (
 
@@ -3652,10 +3611,6 @@ def should_sell(
             "PROFIT + ML REVERSAL"
         )
 
-    # ========================================================
-    # EXPECTED RETURN BECOMES NEGATIVE
-    # ========================================================
-
     if (
 
         learning is not None
@@ -3678,10 +3633,6 @@ def should_sell(
             "EXPECTED RETURN NEGATIVE"
         )
 
-    # ========================================================
-    # MAX HOLD
-    # ========================================================
-
     if holding_minutes >= MAX_HOLD_MINUTES:
 
         return (
@@ -3699,7 +3650,6 @@ def should_sell(
 async def update_market():
 
     global latest_market
-
     global market_updates
 
     market = await fetch_market()
@@ -3793,7 +3743,7 @@ def portfolio_value():
 
 
 # ============================================================
-# DASHBOARD TEXT
+# DASHBOARD
 # ============================================================
 
 def dashboard_text():
@@ -3801,14 +3751,12 @@ def dashboard_text():
     equity = portfolio_value()
 
     pnl = (
-
         equity
         -
         START_BALANCE
     )
 
     roi = (
-
         pnl
         /
         START_BALANCE
@@ -3817,56 +3765,38 @@ def dashboard_text():
     )
 
     total_trades = (
-
         learning.total_trades
-
         if learning
-
         else 0
     )
 
     winrate = (
-
         learning.winrate
-
         if learning
-
         else 0
     )
 
     total_profit = (
-
         learning.total_profit
-
         if learning
-
         else wallet_realized_profit
     )
 
     model_ready = (
-
         learning.ready
-
         if learning
-
         else False
     )
 
     return_ready = (
-
         learning.return_ready
-
         if learning
-
         else False
     )
 
     model_updates = (
-
         learning.model_updates
-
         if learning
-
         else 0
     )
 
@@ -3986,9 +3916,7 @@ def keyboard():
     for text, callback in buttons:
 
         builder.button(
-
             text=text,
-
             callback_data=callback
         )
 
@@ -4000,7 +3928,7 @@ def keyboard():
 
 
 # ============================================================
-# DASHBOARD
+# DASHBOARD MESSAGE
 # ============================================================
 
 async def show_dashboard(
@@ -4157,7 +4085,7 @@ async def trading_loop(
         try:
 
             # ==================================================
-            # DISCOVER MARKETS
+            # DISCOVERY
             # ==================================================
 
             await discover_dynamic_markets()
@@ -4173,7 +4101,6 @@ async def trading_loop(
                 )
             )
 
-            # Удаляем неподтверждённые рынки.
             allowed = set(
                 symbols
             )
@@ -4189,7 +4116,7 @@ async def trading_loop(
                     ]
 
             # ==================================================
-            # MARKET UPDATE
+            # MARKET
             # ==================================================
 
             market_ok = await update_market()
@@ -4278,10 +4205,6 @@ async def trading_loop(
 
                         continue
 
-                    # ------------------------------------------------
-                    # SCORE
-                    # ------------------------------------------------
-
                     if (
                         data.final_score
                         <
@@ -4289,10 +4212,6 @@ async def trading_loop(
                     ):
 
                         continue
-
-                    # ------------------------------------------------
-                    # ML
-                    # ------------------------------------------------
 
                     if (
 
@@ -4311,10 +4230,6 @@ async def trading_loop(
 
                         continue
 
-                    # ------------------------------------------------
-                    # EXPECTED RETURN
-                    # ------------------------------------------------
-
                     if (
 
                         learning is not None
@@ -4331,10 +4246,6 @@ async def trading_loop(
                     ):
 
                         continue
-
-                    # ------------------------------------------------
-                    # NO DEAD COINS
-                    # ------------------------------------------------
 
                     movement = max(
 
@@ -4354,10 +4265,6 @@ async def trading_loop(
                     if movement < 0.15:
 
                         continue
-
-                    # ------------------------------------------------
-                    # BAD DOWNTREND
-                    # ------------------------------------------------
 
                     if (
 
@@ -4382,10 +4289,6 @@ async def trading_loop(
                         )
                     )
 
-                # ==================================================
-                # SORT BEST
-                # ==================================================
-
                 candidates.sort(
 
                     key=lambda item: (
@@ -4402,10 +4305,6 @@ async def trading_loop(
 
                     reverse=True
                 )
-
-                # ==================================================
-                # BUY UP TO 2
-                # ==================================================
 
                 slots = min(
 
@@ -4478,7 +4377,7 @@ async def trading_loop(
 
 
 # ============================================================
-# START
+# START COMMAND
 # ============================================================
 
 @dp.message(
@@ -4966,6 +4865,37 @@ async def history(
 
             closed_at = float(
                 trade["closed_at"]
+                or 0
+            )
+
+            # ВАЖНО:
+            # вычисляем время отдельно,
+            # чтобы не было SyntaxError
+            # из-за многострочного f-string.
+            trade_time = datetime.fromtimestamp(
+                closed_at
+            ).strftime(
+                "%d.%m %H:%M:%S"
+            )
+
+            profit_percent = float(
+                trade["profit_percent"]
+                or 0
+            )
+
+            entry_score = float(
+                trade["entry_score"]
+                or 0
+            )
+
+            ml_probability = float(
+                trade["ml_probability"]
+                or 0
+            )
+
+            reason = (
+                trade["reason"]
+                or "UNKNOWN"
             )
 
             lines.append(
@@ -4978,21 +4908,19 @@ async def history(
                 f"💰 "
                 f"{profit:+.2f}$ "
 
-                f"({trade['profit_percent']:+.2f}%)\n"
+                f"({profit_percent:+.2f}%)\n"
 
                 f"📌 "
-                f"{trade['reason']}\n"
+                f"{reason}\n"
 
                 f"🧠 Entry score: "
-                f"{trade['entry_score']:.1f}\n"
+                f"{entry_score:.1f}\n"
 
                 f"🤖 ML: "
-                f"{float(trade['ml_probability']) * 100:.1f}%\n"
+                f"{ml_probability * 100:.1f}%\n"
 
                 f"⏰ "
-                f"{datetime.fromtimestamp(
-                    closed_at
-                ).strftime('%d.%m %H:%M:%S')}\n"
+                f"{trade_time}\n"
             )
 
         text = "\n".join(
@@ -5164,6 +5092,51 @@ def now_string():
 
 
 # ============================================================
+# INITIALIZE EXCHANGES
+# ============================================================
+
+async def initialize_exchanges():
+
+    for exchange_id in EXCHANGE_IDS:
+
+        try:
+
+            cls = getattr(
+                ccxt,
+                exchange_id
+            )
+
+            exchange = cls({
+
+                "enableRateLimit": True,
+
+                "timeout": 15000
+            })
+
+            await exchange.load_markets()
+
+            exchanges[
+                exchange_id
+            ] = exchange
+
+            print(
+
+                f"[EXCHANGE] "
+                f"{exchange_id}: OK "
+                f"markets={len(exchange.markets)}"
+            )
+
+        except Exception as e:
+
+            print(
+
+                f"[EXCHANGE] "
+                f"{exchange_id}: SKIP - "
+                f"{repr(e)}"
+            )
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -5198,7 +5171,7 @@ async def main():
         )
 
     # ========================================================
-    # DATABASE FIRST
+    # DATABASE
     # ========================================================
 
     print(
@@ -5208,7 +5181,7 @@ async def main():
     init_database()
 
     # ========================================================
-    # LOAD WALLET
+    # WALLET
     # ========================================================
 
     print(
@@ -5236,7 +5209,7 @@ async def main():
     )
 
     # ========================================================
-    # LOAD POSITIONS
+    # POSITIONS
     # ========================================================
 
     print(
@@ -5350,7 +5323,7 @@ async def main():
     print("=" * 70)
 
     # ========================================================
-    # TELEGRAM WEBHOOK
+    # WEBHOOK
     # ========================================================
 
     try:
@@ -5488,51 +5461,6 @@ async def main():
         print(
             "[SHUTDOWN] Bot stopped."
         )
-
-
-# ============================================================
-# INITIALIZE EXCHANGES
-# ============================================================
-
-async def initialize_exchanges():
-
-    for exchange_id in EXCHANGE_IDS:
-
-        try:
-
-            cls = getattr(
-                ccxt,
-                exchange_id
-            )
-
-            exchange = cls({
-
-                "enableRateLimit": True,
-
-                "timeout": 15000
-            })
-
-            await exchange.load_markets()
-
-            exchanges[
-                exchange_id
-            ] = exchange
-
-            print(
-
-                f"[EXCHANGE] "
-                f"{exchange_id}: OK "
-                f"markets={len(exchange.markets)}"
-            )
-
-        except Exception as e:
-
-            print(
-
-                f"[EXCHANGE] "
-                f"{exchange_id}: SKIP - "
-                f"{repr(e)}"
-            )
 
 
 # ============================================================
